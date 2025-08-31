@@ -630,6 +630,8 @@ def display_segment_analysis(df, segment_name):
 # ------------------------------------------------------------
 # Supabase veri kaydetme
 # ------------------------------------------------------------
+# Bu fonksiyonu app.py'de save_data_to_supabase fonksiyonunun yerine koyun
+
 def save_data_to_supabase(df, comments_df=None, period_meta=None):
     """Veriyi Supabase'e kalıcı olarak kaydeder"""
     if not SUPABASE_ENABLED:
@@ -639,25 +641,75 @@ def save_data_to_supabase(df, comments_df=None, period_meta=None):
     try:
         client = get_supabase_client()
         
-        # Period kaydı
-        if period_meta:
-            period_id = save_period(client, period_meta)
-        else:
-            period_id = None
+        # Basit period kaydı - şimdilik sabit period_id kullan
+        period_id = "temp-period-2025-01"  # Geçici çözüm
         
         # TLAG verileri kaydet
         if df is not None and not df.empty:
-            save_tlag_data(client, df, period_id)
-            st.success("✅ TLAG verileri kaydedildi")
+            rows = []
+            for _, row in df.iterrows():
+                def _num(x):
+                    try:
+                        return float(x) if (x is not None and not pd.isna(x)) else None
+                    except:
+                        return None
+                
+                roc_val = str(row.get("ROC_STR") or row.get("ROC") or "").split(".")[0].strip()
+                
+                rows.append({
+                    "roc": roc_val,
+                    "istasyon": row.get("İstasyon"),
+                    "district": row.get("DISTRICT"), 
+                    "nor": row.get("NOR"),
+                    "site_segment": row.get("Site Segment"),
+                    "skor": _num(row.get("SKOR")),
+                    "gecen_sene_skor": _num(row.get("GEÇEN SENE SKOR")),
+                    "fark": _num(row.get("Fark")),
+                    "transaction": _num(row.get("TRANSACTION")),
+                    "period_id": period_id
+                })
+            
+            if rows:
+                # Önce mevcut verileri temizle (aynı period için)
+                client.table("tlag_data").delete().eq("period_id", period_id).execute()
+                # Yeni verileri ekle
+                client.table("tlag_data").insert(rows).execute()
+                st.success(f"✅ {len(rows)} TLAG verisi Supabase'e kaydedildi")
         
         # Yorum verileri kaydet
         if comments_df is not None and not comments_df.empty:
-            save_comment_data(client, comments_df, period_id)
-            st.success("✅ Yorum verileri kaydedildi")
+            comment_rows = []
+            for _, row in comments_df.iterrows():
+                cats = row.get("categories")
+                if isinstance(cats, list):
+                    cats_json = json.dumps(cats, ensure_ascii=False)
+                else:
+                    cats_json = json.dumps([cats] if pd.notna(cats) else [], ensure_ascii=False)
+                
+                roc_val = str(row.get("station_code") or "").strip()
+                
+                comment_rows.append({
+                    "roc": roc_val,
+                    "comment": row.get("comment"),
+                    "score": int(row.get("score")) if pd.notna(row.get("score")) else None,
+                    "categories": cats_json,
+                    "dealer": row.get("dealer"),
+                    "territory": row.get("territory"),
+                    "district": row.get("district"), 
+                    "visit_date": str(row.get("visit_date")) if pd.notna(row.get("visit_date")) else None,
+                    "period_id": period_id
+                })
+            
+            if comment_rows:
+                # Önce mevcut yorumları temizle
+                client.table("customer_comments").delete().eq("period_id", period_id).execute()
+                # Yeni yorumları ekle
+                client.table("customer_comments").insert(comment_rows).execute()
+                st.success(f"✅ {len(comment_rows)} yorum Supabase'e kaydedildi")
             
     except Exception as e:
         st.error(f"Veri kaydetme hatası: {str(e)}")
-
+        st.info("Veriler geçici olarak hafızada tutulacak")
 # ------------------------------------------------------------
 # CSS ve sayfa yapılandırması
 # ------------------------------------------------------------
