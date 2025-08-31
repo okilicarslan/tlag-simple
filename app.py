@@ -68,14 +68,9 @@ def extract_station_code(station_info):
     return m.group(1) if m else None
 
 # ------------------------------------------------------------
-# Supabase entegrasyonu
+# Supabase entegrasyonu - GEÇİCİ OLARAK KAPALI
 # ------------------------------------------------------------
-try:
-    from modules.supabase_client import get_supabase_client
-    SUPABASE_ENABLED = True
-except ImportError:
-    SUPABASE_ENABLED = False
-    print("Supabase modülü yüklenemedi. Lokal modda çalışıyor.")
+SUPABASE_ENABLED = False  # Geçici olarak kapalı
 
 # ------------------------------------------------------------
 # Demo veri yükleme
@@ -376,7 +371,7 @@ def create_enhanced_metric_card(col, title, value, key, click_data=None):
     """Gelişmiş metrik kartları"""
     with col:
         st.markdown(f"""
-        <div class="metric-card" onclick="toggleDetails('{key}')">
+        <div class="metric-card">
             <h2>{value}</h2>
             <p>{title}</p>
             <small>📊 Detay için tıklayın</small>
@@ -628,111 +623,16 @@ def display_segment_analysis(df, segment_name):
             st.dataframe(bottom5, use_container_width=True)
 
 # ------------------------------------------------------------
-# Supabase veri kaydetme
+# Basitleştirilmiş veri kaydetme - Session Only
 # ------------------------------------------------------------
 def save_data_to_supabase(df, comments_df=None, period_meta=None):
-    """Veriyi Supabase'e kalıcı olarak kaydeder"""
+    """Veri session'da saklanıyor - Supabase devre dışı"""
     if not SUPABASE_ENABLED:
-        st.info("Supabase bağlantısı yok - veri geçici olarak hafızada tutulacak")
+        st.info("ℹ️ Veriler session'da saklanıyor - Supabase şu anda devre dışı")
         return
     
-    try:
-        client = get_supabase_client()
-        
-        # Önce periods tablosunda kayıt kontrol et
-        import uuid
-        from datetime import datetime
-        
-        # Mevcut period'u kontrol et
-        existing_period = client.table("periods").select("id").eq("source_filename", "demo_data").eq("year", 2025).eq("month", 1).execute()
-        
-        if existing_period.data:
-            period_id = existing_period.data[0]["id"]
-        else:
-            # Yeni period oluştur
-            period_data = {
-                "source_filename": "demo_data",
-                "period_type": "MONTH",
-                "year": 2025,
-                "month": 1,
-                "quarter": 1,
-                "half": 1,
-                "period_start": "2025-01-01",
-                "period_end": "2025-01-31"
-            }
-            
-            # Insert ve sonra ID'yi al
-            new_period_response = client.table("periods").insert(period_data).execute()
-            period_id = new_period_response.data[0]["id"]
-        
-        # TLAG verileri kaydet
-        if df is not None and not df.empty:
-            # Önce mevcut verileri temizle
-            client.table("tlag_data").delete().eq("period_id", period_id).execute()
-            
-            rows = []
-            for _, row in df.iterrows():
-                def _num(x):
-                    try:
-                        return float(x) if (x is not None and not pd.isna(x)) else None
-                    except:
-                        return None
-                
-                roc_val = str(row.get("ROC_STR") or row.get("ROC") or "").split(".")[0].strip()
-                
-                rows.append({
-                    "roc": roc_val,
-                    "istasyon": row.get("İstasyon"),
-                    "district": row.get("DISTRICT"), 
-                    "nor": row.get("NOR"),
-                    "site_segment": row.get("Site Segment"),
-                    "skor": _num(row.get("SKOR")),
-                    "gecen_sene_skor": _num(row.get("GEÇEN SENE SKOR")),
-                    "fark": _num(row.get("Fark")),
-                    "transaction": _num(row.get("TRANSACTION")),
-                    "period_id": period_id
-                })
-            
-            if rows:
-                # Yeni verileri ekle
-                client.table("tlag_data").insert(rows).execute()
-                st.success(f"✅ {len(rows)} TLAG verisi Supabase'e kaydedildi")
-        
-        # Yorum verileri kaydet
-        if comments_df is not None and not comments_df.empty:
-            # Önce mevcut yorumları temizle
-            client.table("customer_comments").delete().eq("period_id", period_id).execute()
-            
-            comment_rows = []
-            for _, row in comments_df.iterrows():
-                cats = row.get("categories")
-                if isinstance(cats, list):
-                    cats_json = json.dumps(cats, ensure_ascii=False)
-                else:
-                    cats_json = json.dumps([cats] if pd.notna(cats) else [], ensure_ascii=False)
-                
-                roc_val = str(row.get("station_code") or "").strip()
-                
-                comment_rows.append({
-                    "roc": roc_val,
-                    "comment": row.get("comment"),
-                    "score": int(row.get("score")) if pd.notna(row.get("score")) else None,
-                    "categories": cats_json,
-                    "dealer": row.get("dealer"),
-                    "territory": row.get("territory"),
-                    "district": row.get("district"), 
-                    "visit_date": str(row.get("visit_date")) if pd.notna(row.get("visit_date")) else None,
-                    "period_id": period_id
-                })
-            
-            if comment_rows:
-                # Yeni yorumları ekle
-                client.table("customer_comments").insert(comment_rows).execute()
-                st.success(f"✅ {len(comment_rows)} yorum Supabase'e kaydedildi")
-            
-    except Exception as e:
-        st.error(f"Veri kaydetme hatası: {str(e)}")
-        st.info("Veriler geçici olarak hafızada tutulacak")
+    # Supabase kodu buraya gelecek (sonradan)
+    pass
 
 # ------------------------------------------------------------
 # CSS ve sayfa yapılandırması
@@ -889,6 +789,9 @@ def main():
                             "nor": nor_analysis
                         }
                         st.sidebar.success("✅ Yorum demo verisi yüklendi")
+                    
+                    # Session'a kaydet
+                    save_data_to_supabase(tlag_df, merged_comments if comments_df is not None else None)
                 else:
                     st.sidebar.error(message)
     
@@ -900,7 +803,7 @@ def main():
                 st.session_state.tlag_data = df
                 st.sidebar.success(f"✅ {len(df)} istasyon verisi yüklendi")
                 
-                # Supabase'e kaydet
+                # Session'a kaydet
                 save_data_to_supabase(df)
     
     if uploaded_comments is not None and st.session_state.tlag_data is not None:
@@ -922,7 +825,7 @@ def main():
                 
                 st.sidebar.success(f"✅ {len(comments_df)} yorum yüklendi ve analiz edildi")
                 
-                # Supabase'e kaydet
+                # Session'a kaydet
                 save_data_to_supabase(None, merged_comments)
     
     # MAIN CONTENT
@@ -967,11 +870,11 @@ def display_main_dashboard():
         with col1:
             st.markdown("""
             ### 📊 YENİ ÖZELLİKLER
-            - ✅ Kalıcı veri saklama
             - ✅ Tıklanabilir metrikler
             - ✅ Detaylı istasyon analizi
             - ✅ Gelişmiş yorum kategorileme
             - ✅ Fırsat istasyonu tespiti
+            - ✅ Session bazlı veri saklama
             """)
         
         with col2:
@@ -1244,7 +1147,7 @@ def display_detailed_district_analysis(district_name, df):
     with st.expander("🤖 AI Destekli İyileştirme Önerileri"):
         if st.button(f"🤖 {district_name} için AI Analizi Oluştur", key=f"ai_district_{district_name}"):
             with st.spinner("AI analizi yapılıyor..."):
-                # Burada AI analizi yapılabilir
+                # Basit AI analizi
                 st.markdown(f"""
                 ### 📊 {district_name} AI Analizi
                 
