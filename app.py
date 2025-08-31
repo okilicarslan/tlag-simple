@@ -630,8 +630,6 @@ def display_segment_analysis(df, segment_name):
 # ------------------------------------------------------------
 # Supabase veri kaydetme
 # ------------------------------------------------------------
-# Bu fonksiyonu app.py'de save_data_to_supabase fonksiyonunun yerine koyun
-
 def save_data_to_supabase(df, comments_df=None, period_meta=None):
     """Veriyi Supabase'e kalıcı olarak kaydeder"""
     if not SUPABASE_ENABLED:
@@ -641,8 +639,32 @@ def save_data_to_supabase(df, comments_df=None, period_meta=None):
     try:
         client = get_supabase_client()
         
-        # Basit period kaydı - şimdilik sabit period_id kullan
-        period_id = "temp-period-2025-01"  # Geçici çözüm
+        # Önce periods tablosunda kayıt oluştur
+        import uuid
+        from datetime import datetime
+        
+        period_data = {
+            "id": str(uuid.uuid4()),  # Gerçek UUID oluştur
+            "source_filename": "demo_data",
+            "period_type": "MONTH",
+            "year": 2025,
+            "month": 1,
+            "quarter": 1,
+            "half": 1,
+            "period_start": "2025-01-01",
+            "period_end": "2025-01-31",
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Period kaydını kontrol et ve oluştur
+        existing_period = client.table("periods").select("id").eq("source_filename", "demo_data").eq("year", 2025).eq("month", 1).execute()
+        
+        if existing_period.data:
+            period_id = existing_period.data[0]["id"]
+        else:
+            # Yeni period oluştur
+            new_period = client.table("periods").insert(period_data).select("id").execute()
+            period_id = new_period.data[0]["id"]
         
         # TLAG verileri kaydet
         if df is not None and not df.empty:
