@@ -639,35 +639,37 @@ def save_data_to_supabase(df, comments_df=None, period_meta=None):
     try:
         client = get_supabase_client()
         
-        # Önce periods tablosunda kayıt oluştur
+        # Önce periods tablosunda kayıt kontrol et
         import uuid
         from datetime import datetime
         
-        period_data = {
-            "id": str(uuid.uuid4()),  # Gerçek UUID oluştur
-            "source_filename": "demo_data",
-            "period_type": "MONTH",
-            "year": 2025,
-            "month": 1,
-            "quarter": 1,
-            "half": 1,
-            "period_start": "2025-01-01",
-            "period_end": "2025-01-31",
-            "created_at": datetime.now().isoformat()
-        }
-        
-        # Period kaydını kontrol et ve oluştur
+        # Mevcut period'u kontrol et
         existing_period = client.table("periods").select("id").eq("source_filename", "demo_data").eq("year", 2025).eq("month", 1).execute()
         
         if existing_period.data:
             period_id = existing_period.data[0]["id"]
         else:
             # Yeni period oluştur
-            new_period = client.table("periods").insert(period_data).select("id").execute()
-            period_id = new_period.data[0]["id"]
+            period_data = {
+                "source_filename": "demo_data",
+                "period_type": "MONTH",
+                "year": 2025,
+                "month": 1,
+                "quarter": 1,
+                "half": 1,
+                "period_start": "2025-01-01",
+                "period_end": "2025-01-31"
+            }
+            
+            # Insert ve sonra ID'yi al
+            new_period_response = client.table("periods").insert(period_data).execute()
+            period_id = new_period_response.data[0]["id"]
         
         # TLAG verileri kaydet
         if df is not None and not df.empty:
+            # Önce mevcut verileri temizle
+            client.table("tlag_data").delete().eq("period_id", period_id).execute()
+            
             rows = []
             for _, row in df.iterrows():
                 def _num(x):
@@ -692,14 +694,15 @@ def save_data_to_supabase(df, comments_df=None, period_meta=None):
                 })
             
             if rows:
-                # Önce mevcut verileri temizle (aynı period için)
-                client.table("tlag_data").delete().eq("period_id", period_id).execute()
                 # Yeni verileri ekle
                 client.table("tlag_data").insert(rows).execute()
                 st.success(f"✅ {len(rows)} TLAG verisi Supabase'e kaydedildi")
         
         # Yorum verileri kaydet
         if comments_df is not None and not comments_df.empty:
+            # Önce mevcut yorumları temizle
+            client.table("customer_comments").delete().eq("period_id", period_id).execute()
+            
             comment_rows = []
             for _, row in comments_df.iterrows():
                 cats = row.get("categories")
@@ -723,8 +726,6 @@ def save_data_to_supabase(df, comments_df=None, period_meta=None):
                 })
             
             if comment_rows:
-                # Önce mevcut yorumları temizle
-                client.table("customer_comments").delete().eq("period_id", period_id).execute()
                 # Yeni yorumları ekle
                 client.table("customer_comments").insert(comment_rows).execute()
                 st.success(f"✅ {len(comment_rows)} yorum Supabase'e kaydedildi")
@@ -732,6 +733,7 @@ def save_data_to_supabase(df, comments_df=None, period_meta=None):
     except Exception as e:
         st.error(f"Veri kaydetme hatası: {str(e)}")
         st.info("Veriler geçici olarak hafızada tutulacak")
+
 # ------------------------------------------------------------
 # CSS ve sayfa yapılandırması
 # ------------------------------------------------------------
