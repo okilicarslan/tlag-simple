@@ -47,11 +47,9 @@ def normalize_roc(val):
     s = str(val).strip()
     if s.endswith(".0"):
         s = s[:-2]
-    # Son 4 haneyi al (müşteri yorumları için)
     m = re.search(r"#(\d{4})$", s)
     if m:
         return m.group(1)
-    # Sadece rakam varsa al
     m = re.search(r"(\d+)", s)
     return m.group(1) if m else None
 
@@ -60,18 +58,36 @@ def extract_station_code(station_info):
     if pd.isna(station_info):
         return None
     s = str(station_info)
-    # #5789 formatı
     m = re.search(r"#(\d{4})$", s)
     if m:
         return m.group(1)
-    # Son 4 rakamı al
     m = re.search(r"(\d{4})(?=\D*$)", s)
     return m.group(1) if m else None
 
 # ------------------------------------------------------------
-# Supabase entegrasyonu - GEÇİCİ OLARAK KAPALI
+# Supabase entegrasyonu
 # ------------------------------------------------------------
-SUPABASE_ENABLED = False  # Geçici olarak kapalı
+SUPABASE_ENABLED = True
+
+try:
+    from supabase import create_client, Client
+    
+    def init_supabase():
+        """Supabase client başlatma"""
+        try:
+            url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", None)
+            key = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY", None)
+            
+            if url and key:
+                return create_client(url, key)
+            return None
+        except:
+            return None
+    
+    supabase: Client = init_supabase()
+except ImportError:
+    supabase = None
+    SUPABASE_ENABLED = False
 
 # ------------------------------------------------------------
 # OpenAI AI Analiz Fonksiyonları
@@ -79,157 +95,432 @@ SUPABASE_ENABLED = False  # Geçici olarak kapalı
 def get_openai_api_key():
     """OpenAI API anahtarını al"""
     try:
-        # Önce environment variable'dan dene
         api_key = os.getenv("OPENAI_API_KEY")
         if api_key:
             return api_key
-        
-        # Sonra Streamlit secrets'tan dene
         if hasattr(st, 'secrets') and 'openai' in st.secrets:
             return st.secrets.openai.api_key
-        
         return None
     except:
         return None
 
-def ai_recommendations_for_scope(scope_name, df_scope, comments_scope=None):
-    """Belirli bir scope (District/NOR/İstasyon) için AI analizi"""
+def ai_chat_interface(df, comments_df=None):
+    """AI Chat Interface - Enter ile çalışır"""
+    st.markdown("### 🤖 AI TLAG UZMANI")
+    
+    with st.container():
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                    padding: 1rem; border-radius: 15px; color: white;">
+            <p style="color: white; margin: 0;">Sorularınızı yazıp Enter'a basın. Örn: "Ankara Güney'in skorunu nasıl artırırım?"</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
+        
+        # Form ile Enter desteği
+        with st.form(key="ai_chat_form", clear_on_submit=True):
+            user_query = st.text_input(
+                "Sorunuz:",
+                placeholder="İstasyon, NOR veya District analizi için soru yazın...",
+                label_visibility="collapsed"
+            )
+            
+            col1, col2 = st.columns([6, 1])
+            with col1:
+                submit = st.form_submit_button("🚀 Analiz", use_container_width=True, type="primary")
+            with col2:
+                if st.form_submit_button("🗑️", use_container_width=True):
+                    st.session_state.chat_history = []
+                    st.rerun()
+        
+        if submit and user_query:
+            with st.spinner("Analiz yapılıyor... (5-10 saniye)"):
+                response = get_ai_response(user_query, df, comments_df)
+                st.session_state.chat_history.append({
+                    "query": user_query,
+                    "response": response,
+                    "timestamp": datetime.now().strftime("%H:%M")
+                })
+        
+        # Chat geçmişi
+        if st.session_state.chat_history:
+            for chat in reversed(st.session_state.chat_history[-3:]):  # Son 3 mesaj
+                with st.container():
+                    st.markdown(f"**🕐 {chat['timestamp']} - Soru:** {chat['query']}")
+                    st.info(chat['response'])
+
+def get_ai_response(query, df, comments_df=None):
+    """AI analizi - Hızlı ve spesifik"""
+    api_key = get_openai_api_key()
+    if not api_key:
+        return "⚠️ OpenAI API anahtarı bulunamadı."
+    
     try:
-        try:
-            import openai
-        except ImportError:
-            return "### 📦 OpenAI Modülü Gerekli\n\nAI önerileri için `pip install openai` kurun."
+        from openai import OpenAI
         
-        api_key = get_openai_api_key()
-        if not api_key:
-            return "### 🔑 OpenAI API Anahtarı Gerekli\n\nSecrets'a OpenAI API anahtarınızı ekleyin."
+        # Sorgu analizi
+        query_lower = query.lower()
+        target_nor = None
+        target_district = None
         
-        # Data özeti hazırla
-        if df_scope is not None and not df_scope.empty:
-            station_count = len(df_scope)
-            avg_score = df_scope["SKOR"].mean() * 100 if "SKOR" in df_scope.columns else 0
-            
-            # En iyi ve en kötü istasyonlar
-            if "SKOR" in df_scope.columns:
-                best_stations = df_scope.nlargest(3, "SKOR")[["İstasyon", "SKOR"]].to_dict('records')
-                worst_stations = df_scope.nsmallest(3, "SKOR")[["İstasyon", "SKOR"]].to_dict('records')
-            else:
-                best_stations = worst_stations = []
-            
-            # Segment dağılımı
-            if "Site Segment" in df_scope.columns:
-                segments = df_scope["Site Segment"].value_counts().to_dict()
-            else:
-                segments = {}
-        else:
-            station_count = avg_score = 0
-            best_stations = worst_stations = []
-            segments = {}
+        if "NOR" in df.columns:
+            for nor in df["NOR"].dropna().unique():
+                if str(nor).lower() in query_lower:
+                    target_nor = nor
+                    break
         
-        # Yorum analizi özeti
-        comment_summary = ""
-        if comments_scope is not None and not comments_scope.empty:
-            total_comments = len(comments_scope)
-            avg_comment_score = comments_scope["score"].mean() if "score" in comments_scope.columns else 0
-            
-            # Kategori analizi
-            category_problems = {}
-            if "categories" in comments_scope.columns:
-                for _, row in comments_scope.iterrows():
-                    if isinstance(row["categories"], list):
-                        for cat in row["categories"]:
-                            if cat not in category_problems:
-                                category_problems[cat] = []
-                            category_problems[cat].append(row.get("score", 5))
-            
-            # Problem kategorileri (düşük puan alan)
-            problem_cats = {}
-            for cat, scores in category_problems.items():
-                avg_cat_score = np.mean(scores)
-                if avg_cat_score < 4.0:
-                    problem_cats[cat] = {
-                        "avg_score": avg_cat_score,
-                        "count": len(scores)
-                    }
-            
-            # Düşük puan yorumları örnekleri
-            low_score_comments = comments_scope[comments_scope["score"] <= 3]["comment"].head(5).tolist()
-            
-            comment_summary = f"""
-            YORUM ANALİZİ:
-            - Toplam yorum: {total_comments}
-            - Ortalama puan: {avg_comment_score:.1f}/5
-            - Problem kategorileri: {problem_cats}
-            - Düşük puan yorum örnekleri: {low_score_comments[:3]}
-            """
+        if "DISTRICT" in df.columns:
+            for district in df["DISTRICT"].dropna().unique():
+                if str(district).lower() in query_lower:
+                    target_district = district
+                    break
         
-        # AI prompt hazırla
-        prompt = f"""Sen bir petrol istasyonu performans analisti olan uzman bir AI'sın. {scope_name} bölgesi için detaylı analiz yapmanı istiyorum.
+        # Veri filtreleme
+        filtered_df = df.copy()
+        filtered_comments = comments_df.copy() if comments_df is not None else pd.DataFrame()
+        
+        if target_nor:
+            filtered_df = df[df["NOR"] == target_nor]
+            if not filtered_comments.empty and "NOR_FINAL" in filtered_comments.columns:
+                filtered_comments = filtered_comments[filtered_comments["NOR_FINAL"] == target_nor]
+        elif target_district:
+            filtered_df = df[df["DISTRICT"] == target_district]
+            if not filtered_comments.empty and "DISTRICT_FINAL" in filtered_comments.columns:
+                filtered_comments = filtered_comments[filtered_comments["DISTRICT_FINAL"] == target_district]
+        
+        # Kritik veriler
+        worst_3 = filtered_df.nsmallest(3, "SKOR")[["İstasyon", "SKOR"]].to_dict('records')
+        avg_score = filtered_df['SKOR'].mean() * 100
+        
+        problem_cats = {}
+        if not filtered_comments.empty:
+            for _, row in filtered_comments.iterrows():
+                if row.get("score", 5) <= 3 and isinstance(row.get("categories"), list):
+                    for cat in row["categories"]:
+                        if cat not in problem_cats:
+                            problem_cats[cat] = 0
+                        problem_cats[cat] += 1
+        
+        top_problems = sorted(problem_cats.items(), key=lambda x: x[1], reverse=True)[:3]
+        
+        # Kısa ve öz prompt
+        prompt = f"""TLAG uzmanı olarak analiz et:
 
-VERİ ÖZETİ:
-- İstasyon sayısı: {station_count}
-- Ortalama performans skoru: {avg_score:.1f}%
-- Segment dağılımı: {segments}
-- En iyi 3 istasyon: {best_stations}
-- En kötü 3 istasyon: {worst_stations}
+VERİ:
+- {len(filtered_df)} istasyon, Ort: {avg_score:.1f}%
+- En kötü 3: {', '.join([f"{s['İstasyon']} ({s['SKOR']*100:.1f}%)" for s in worst_3])}
+- Problem kategoriler: {', '.join([f"{cat}({count})" for cat, count in top_problems])}
 
-{comment_summary}
+Soru: {query}
+
+KISA ve SOMUT yanıt:
+1. Hangi istasyona müdahale?
+2. Hangi kategoriye odaklan?
+3. Beklenen artış?
+
+Gerçek istasyon isimleri kullan. Max 5 cümle."""
+        
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=300
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        return f"Hata: {str(e)}"
+    
+    try:
+        import openai
+        from openai import OpenAI
+        
+        # Sorgudan NOR/District/İstasyon tespit et
+        query_lower = query.lower()
+        target_nor = None
+        target_district = None
+        target_station = None
+        
+        # NOR kontrolü
+        if "NOR" in df.columns:
+            for nor in df["NOR"].dropna().unique():
+                if str(nor).lower() in query_lower:
+                    target_nor = nor
+                    break
+        
+        # District kontrolü
+        if "DISTRICT" in df.columns:
+            for district in df["DISTRICT"].dropna().unique():
+                if str(district).lower() in query_lower:
+                    target_district = district
+                    break
+        
+        # İstasyon kontrolü
+        if "İstasyon" in df.columns:
+            for station in df["İstasyon"].dropna().unique():
+                if str(station).lower() in query_lower:
+                    target_station = station
+                    break
+        
+        # Hedef bölge verilerini filtrele
+        filtered_df = df.copy()
+        filtered_comments = comments_df.copy() if comments_df is not None else pd.DataFrame()
+        scope_name = "TÜM TÜRKİYE"
+        
+        if target_station:
+            filtered_df = df[df["İstasyon"] == target_station]
+            scope_name = f"{target_station} İSTASYONU"
+            if not filtered_comments.empty and "İstasyon" in filtered_comments.columns:
+                filtered_comments = filtered_comments[filtered_comments["İstasyon"] == target_station]
+        elif target_nor:
+            filtered_df = df[df["NOR"] == target_nor]
+            scope_name = f"{target_nor} NOR BÖLGESİ"
+            if not filtered_comments.empty and "NOR_FINAL" in filtered_comments.columns:
+                filtered_comments = filtered_comments[filtered_comments["NOR_FINAL"] == target_nor]
+        elif target_district:
+            filtered_df = df[df["DISTRICT"] == target_district]
+            scope_name = f"{target_district} DISTRICT BÖLGESİ"
+            if not filtered_comments.empty and "DISTRICT_FINAL" in filtered_comments.columns:
+                filtered_comments = filtered_comments[filtered_comments["DISTRICT_FINAL"] == target_district]
+        
+        # DETAYLI VERİ ANALİZİ
+        detailed_analysis = f"""
+===== {scope_name} DETAYLI VERİ ANALİZİ =====
+
+📊 İSTASYON VERİLERİ:
+- Toplam istasyon sayısı: {len(filtered_df)}
+- Ortalama TLAG skoru: {filtered_df['SKOR'].mean()*100:.2f}%
+- En yüksek TLAG skoru: {filtered_df['SKOR'].max()*100:.2f}%
+- En düşük TLAG skoru: {filtered_df['SKOR'].min()*100:.2f}%
+- Standart sapma: {filtered_df['SKOR'].std()*100:.2f}%
+"""
+        
+        # EN DÜŞÜK SKORLU İSTASYONLAR - DETAYLI
+        if "SKOR" in filtered_df.columns and len(filtered_df) > 0:
+            worst_stations = filtered_df.nsmallest(min(10, len(filtered_df)), "SKOR")
+            detailed_analysis += "\n🔴 EN DÜŞÜK SKORLU İSTASYONLAR (Acil müdahale gerekli):\n"
+            for idx, (_, row) in enumerate(worst_stations.iterrows(), 1):
+                detailed_analysis += f"{idx}. {row['İstasyon']}: {row['SKOR']*100:.1f}% "
+                if "Site Segment" in row:
+                    detailed_analysis += f"(Segment: {row['Site Segment']})"
+                if "TRANSACTION" in row and pd.notna(row['TRANSACTION']):
+                    detailed_analysis += f" [Transaction: {row['TRANSACTION']:.0f}]"
+                improvement_potential = (0.80 - row['SKOR']) * 100
+                if improvement_potential > 0:
+                    detailed_analysis += f" → İyileştirme potansiyeli: +{improvement_potential:.1f} puan"
+                detailed_analysis += "\n"
+        
+        # EN YÜKSEK SKORLU İSTASYONLAR
+        if "SKOR" in filtered_df.columns and len(filtered_df) > 3:
+            best_stations = filtered_df.nlargest(min(5, len(filtered_df)), "SKOR")
+            detailed_analysis += "\n✅ EN YÜKSEK SKORLU İSTASYONLAR (Başarı örnekleri):\n"
+            for idx, (_, row) in enumerate(best_stations.iterrows(), 1):
+                detailed_analysis += f"{idx}. {row['İstasyon']}: {row['SKOR']*100:.1f}%\n"
+        
+        # SEGMENT ANALİZİ
+        if "Site Segment" in filtered_df.columns:
+            segment_analysis = filtered_df.groupby("Site Segment").agg({
+                "İstasyon": "count",
+                "SKOR": ["mean", "min", "max"]
+            })
+            detailed_analysis += "\n📈 SEGMENT BAZLI ANALİZ:\n"
+            for segment in segment_analysis.index:
+                count = segment_analysis.loc[segment, ("İstasyon", "count")]
+                avg_score = segment_analysis.loc[segment, ("SKOR", "mean")] * 100
+                min_score = segment_analysis.loc[segment, ("SKOR", "min")] * 100
+                max_score = segment_analysis.loc[segment, ("SKOR", "max")] * 100
+                detailed_analysis += f"- {segment}: {count} istasyon, Ortalama: {avg_score:.1f}%, Min: {min_score:.1f}%, Max: {max_score:.1f}%\n"
+        
+        # FIRSAT İSTASYONLARI
+        if "Site Segment" in filtered_df.columns:
+            opportunity = filtered_df[
+                (filtered_df["Site Segment"].isin(["My Precious", "Primitive"])) & 
+                (filtered_df["SKOR"] < 0.80)
+            ]
+            if not opportunity.empty:
+                detailed_analysis += f"\n💎 FIRSAT İSTASYONLARI: {len(opportunity)} adet\n"
+                for _, row in opportunity.head(5).iterrows():
+                    detailed_analysis += f"- {row['İstasyon']}: {row['SKOR']*100:.1f}% → Hedef: 80% (Potansiyel: +{(0.80-row['SKOR'])*100:.1f} puan)\n"
+        
+        # MÜŞTERİ YORUMLARI ANALİZİ
+        if not filtered_comments.empty and "score" in filtered_comments.columns:
+            detailed_analysis += f"""
+
+💬 MÜŞTERİ YORUMLARI ANALİZİ:
+- Toplam yorum sayısı: {len(filtered_comments)}
+- Ortalama müşteri puanı: {filtered_comments['score'].mean():.2f}/5
+- 5 puan veren müşteri sayısı: {len(filtered_comments[filtered_comments['score'] == 5])} ({len(filtered_comments[filtered_comments['score'] == 5])/len(filtered_comments)*100:.1f}%)
+- 4 puan veren müşteri sayısı: {len(filtered_comments[filtered_comments['score'] == 4])} ({len(filtered_comments[filtered_comments['score'] == 4])/len(filtered_comments)*100:.1f}%)
+- 3 puan veren müşteri sayısı: {len(filtered_comments[filtered_comments['score'] == 3])} ({len(filtered_comments[filtered_comments['score'] == 3])/len(filtered_comments)*100:.1f}%)
+- 1-2 puan veren (kritik) müşteri sayısı: {len(filtered_comments[filtered_comments['score'] <= 2])} ({len(filtered_comments[filtered_comments['score'] <= 2])/len(filtered_comments)*100:.1f}%)
+"""
+            
+            # KATEGORİ BAZLI DETAYLI ANALİZ
+            category_analysis = {}
+            for _, row in filtered_comments.iterrows():
+                if isinstance(row.get("categories"), list):
+                    for cat in row["categories"]:
+                        if cat not in category_analysis:
+                            category_analysis[cat] = {
+                                "scores": [],
+                                "comments": [],
+                                "stations": []
+                            }
+                        category_analysis[cat]["scores"].append(row["score"])
+                        if pd.notna(row.get("comment")):
+                            category_analysis[cat]["comments"].append(str(row["comment"])[:200])
+                        if pd.notna(row.get("İstasyon")):
+                            category_analysis[cat]["stations"].append(row["İstasyon"])
+            
+            # Problem kategorilerini tespit et
+            detailed_analysis += "\n🔍 KATEGORİ BAZLI PROBLEM ANALİZİ:\n"
+            problem_categories = []
+            
+            for cat, data in category_analysis.items():
+                avg_score = np.mean(data["scores"])
+                count = len(data["scores"])
+                
+                if avg_score < 4.0 and count >= 3:  # Problem kategorisi
+                    problem_categories.append((cat, avg_score, count, data))
+            
+            # Problemleri önem sırasına göre sırala
+            problem_categories.sort(key=lambda x: (x[1], -x[2]))  # Önce düşük puan, sonra yüksek sayı
+            
+            for cat, avg_score, count, data in problem_categories[:5]:  # En problemli 5 kategori
+                detailed_analysis += f"\n⚠️ {cat}: {count} yorum, Ortalama: {avg_score:.1f}/5\n"
+                
+                # Bu kategoride en çok şikayet alan istasyonlar
+                if data["stations"]:
+                    station_counts = pd.Series(data["stations"]).value_counts().head(3)
+                    detailed_analysis += f"   En çok şikayet alan istasyonlar:\n"
+                    for station, s_count in station_counts.items():
+                        detailed_analysis += f"   - {station}: {s_count} şikayet\n"
+                
+                # Düşük puanlı yorumlardan örnekler
+                low_score_comments = [
+                    (score, comment) 
+                    for score, comment in zip(data["scores"], data["comments"]) 
+                    if score <= 3
+                ][:3]
+                
+                if low_score_comments:
+                    detailed_analysis += f"   Örnek şikayetler:\n"
+                    for score, comment in low_score_comments:
+                        detailed_analysis += f"   • ({score}/5 puan) \"{comment[:100]}...\"\n"
+            
+            # İyi performans gösteren kategoriler
+            good_categories = [(cat, np.mean(data["scores"]), len(data["scores"])) 
+                             for cat, data in category_analysis.items() 
+                             if np.mean(data["scores"]) >= 4.5 and len(data["scores"]) >= 3]
+            
+            if good_categories:
+                detailed_analysis += "\n✅ İYİ PERFORMANS GÖSTEREN KATEGORİLER:\n"
+                for cat, avg_score, count in good_categories[:3]:
+                    detailed_analysis += f"- {cat}: {count} yorum, Ortalama: {avg_score:.1f}/5\n"
+            
+            # İSTASYON BAZLI YORUM ANALİZİ
+            if "İstasyon" in filtered_comments.columns:
+                station_comments = filtered_comments.groupby("İstasyon").agg({
+                    "score": ["mean", "count"],
+                    "comment": lambda x: list(x)[:3]  # İlk 3 yorum
+                })
+                
+                detailed_analysis += "\n📍 İSTASYON BAZLI YORUM ANALİZİ:\n"
+                
+                # En kötü yorum alan istasyonlar
+                worst_comment_stations = station_comments.sort_values(("score", "mean")).head(5)
+                for station in worst_comment_stations.index:
+                    avg = station_comments.loc[station, ("score", "mean")]
+                    count = station_comments.loc[station, ("score", "count")]
+                    if avg < 4.0:
+                        detailed_analysis += f"- {station}: {count} yorum, Ortalama: {avg:.1f}/5 ⚠️\n"
+        
+        # ÖZET TLAG SKORU HESAPLAMASI
+        if not filtered_comments.empty and "score" in filtered_comments.columns:
+            score_5_count = len(filtered_comments[filtered_comments["score"] == 5])
+            total_surveys = len(filtered_comments)
+            calculated_tlag = (score_5_count / total_surveys * 100) if total_surveys > 0 else 0
+            detailed_analysis += f"\n📊 HESAPLANAN TLAG SKORU: {calculated_tlag:.2f}% (5 puan veren / toplam anket)\n"
+        
+        # AI'ya gönderilecek prompt
+        prompt = f"""Sen deneyimli bir TLAG (petrol istasyonu) performans uzmanısın. Elindeki GERÇEK VERİLER:
+
+{detailed_analysis}
+
+Kullanıcı sorusu: {query}
 
 GÖREV:
-1. Bu verilere dayanarak {scope_name} bölgesi için kapsamlı bir performans analizi yap
-2. Ana sorun alanlarını tespit et
-3. Her sorun alanı için spesifik, uygulanabilir çözüm önerileri ver
-4. Öncelik sıralaması yap (yüksek/orta/düşük)
-5. Beklenen iyileştirme yüzdesini tahmin et
+1. Yukarıdaki VERİLERİ DETAYLI İNCELE
+2. Sorulan soruya SADECE VERİLERE DAYALI cevap ver
+3. GERÇEK İSTASYON İSİMLERİ kullan
+4. GERÇEK SKORLAR ve YÜZDELER kullan
+5. Somut, ölçülebilir öneriler sun
+6. Her öneri için TAHMİNİ SKOR ARTIŞI belirt
 
-ÇIKTI FORMATI:
-### 📊 {scope_name} Performans Analizi
+ÖNEMLİ:
+- Genel tavsiyelerden KAÇIN
+- Sadece yukarıdaki verilerde OLAN bilgileri kullan
+- İstasyon isimlerini ve skorları doğru kullan
+- Problem kategorilerini ve yorumları dikkate al
 
-**Ana Bulgular:**
-- [Temel performans durumu]
-- [Kritik sorun alanları]
-- [Fırsat alanları]
-
-**Öncelikli Aksiyon Planı:**
-
-🔴 **Yüksek Öncelik:**
-1. [Spesifik aksiyon] - Beklenen iyileştirme: X%
-2. [Spesifik aksiyon] - Beklenen iyileştirme: X%
-
-🟡 **Orta Öncelik:**
-1. [Spesifik aksiyon]
-2. [Spesifik aksiyon]
-
-**Detaylı Öneriler:**
-- [Her kategori için spesifik öneriler]
-
-**Beklenen Toplam İyileştirme:** +X puan
-
-Türkçe yanıt ver ve pratik, uygulanabilir öneriler sun."""
-
+Türkçe yanıtla ve VERİYE DAYALI öneriler sun."""
+        
         # OpenAI API çağrısı
-        try:
-            client = openai.OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=1500
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            # Eski API syntax'ını dene
-            openai.api_key = api_key
-            response = openai.ChatCompletion.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=1500
-            )
-            return response.choices[0].message.content.strip()
-            
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Sen bir TLAG performans uzmanısın. SADECE sana verilen gerçek verilere dayanarak analiz yaparsın."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,  # Çok düşük temperature = daha tutarlı ve veriye bağlı
+            max_tokens=1500
+        )
+        
+        return response.choices[0].message.content
+        
+    except ImportError:
+        return "⚠️ OpenAI modülü kurulu değil. Terminal'de: pip install openai"
     except Exception as e:
-        return f"### ❌ AI Analiz Hatası\n\nHata: {str(e)}\n\nLütfen OpenAI API anahtarınızı kontrol edin."
+        return f"❌ AI analiz hatası: {str(e)}\n\nLütfen OpenAI API anahtarınızı kontrol edin."
+
+def ai_recommendations_for_scope(scope_name, df_scope, comments_scope=None):
+    """Belirli bir scope için AI analizi"""
+    api_key = get_openai_api_key()
+    if not api_key:
+        return "### 🔑 OpenAI API Anahtarı Gerekli\n\n.env dosyasına OPENAI_API_KEY ekleyin."
+    
+    try:
+        import openai
+        from openai import OpenAI
+        
+        # Data özeti hazırla
+        station_count = len(df_scope) if df_scope is not None else 0
+        avg_score = df_scope["SKOR"].mean() * 100 if df_scope is not None and "SKOR" in df_scope.columns else 0
+        
+        prompt = f"""Sen bir petrol istasyonu performans uzmanısın. {scope_name} için analiz yap.
+
+        VERİ:
+        - İstasyon sayısı: {station_count}
+        - Ortalama skor: {avg_score:.1f}%
+        
+        Kısa ve net öneriler ver. Türkçe yanıtla."""
+        
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=500
+        )
+        
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"### ❌ AI Analiz Hatası\n\n{str(e)}"
 
 # ------------------------------------------------------------
 # Demo veri yükleme
@@ -252,7 +543,13 @@ def load_demo_data_from_cloud():
                 tlag_df[col] = pd.to_numeric(tlag_df[col], errors="coerce")
 
         if "ROC_STR" not in tlag_df.columns and "ROC" in tlag_df.columns:
-            tlag_df["ROC_STR"] = tlag_df["ROC"].astype(str).str.split(".").str[0]
+            tlag_df["ROC_STR"] = tlag_df["ROC"].apply(lambda x: str(int(x)) if pd.notna(x) else str(x))
+        
+        # Sıralama ekle
+        if "SKOR" in tlag_df.columns:
+            valid_scores = tlag_df["SKOR"].notna()
+            tlag_df.loc[valid_scores, "SIRALAMA"] = tlag_df.loc[valid_scores, "SKOR"].rank(ascending=False, method="min")
+            tlag_df["SIRALAMA"] = tlag_df["SIRALAMA"].apply(lambda x: int(x) if pd.notna(x) else None)
 
         r2 = requests.get(COMMENTS_DEMO_URL, timeout=60)
         r2.raise_for_status()
@@ -329,13 +626,44 @@ def categorize_comment_enhanced(comment_text):
     return categories if categories else ["GENEL"]
 
 # ------------------------------------------------------------
+# TLAG SKOR HESAPLAMA
+# ------------------------------------------------------------
+def calculate_tlag_score(df):
+    """TLAG skorunu hesaplar: 5 puan verilen anket sayısı / toplam anket sayısı"""
+    if "score_5_count" in df.columns and "total_surveys" in df.columns:
+        df["TLAG_CALCULATED"] = df["score_5_count"] / df["total_surveys"]
+        if "SKOR" not in df.columns:
+            df["SKOR"] = df["TLAG_CALCULATED"]
+    return df
+
+# ------------------------------------------------------------
 # Veri yükleme fonksiyonları
 # ------------------------------------------------------------
 def load_tlag_data(uploaded_file):
     """TLAG Excel dosyasını yükler"""
     try:
-        df = pd.read_excel(uploaded_file, sheet_name="TLAG DOKUNMA (2)", engine="openpyxl")
+        xls = pd.ExcelFile(uploaded_file, engine="openpyxl")
+        available_sheets = xls.sheet_names
+        
+        target_sheet = None
+        for sheet in available_sheets:
+            if "TLAG" in sheet.upper():
+                target_sheet = sheet
+                break
+        
+        if target_sheet is None:
+            target_sheet = available_sheets[0]
+            st.info(f"TLAG sheet bulunamadı, '{target_sheet}' kullanılıyor")
+        
+        df = pd.read_excel(uploaded_file, sheet_name=target_sheet, engine="openpyxl")
         df.columns = df.columns.str.strip()
+        
+        # Kolon kontrolü
+        required_cols = ["ROC", "İstasyon"]
+        if not all(col in df.columns for col in required_cols):
+            st.error(f"Gerekli kolonlar bulunamadı. Mevcut: {df.columns.tolist()}")
+            return None
+        
         df = df.dropna(subset=["ROC", "İstasyon"], how="any")
         
         # Numeric columns
@@ -352,8 +680,16 @@ def load_tlag_data(uploaded_file):
                 df[col] = df[col].replace("nan", np.nan)
         
         # ROC normalizasyonu
-        df["ROC_STR"] = df["ROC"].astype(str).str.split(".").str[0]
+        df["ROC_STR"] = df["ROC"].apply(lambda x: str(int(x)) if pd.notna(x) else None)
         df["ROC_NORMALIZED"] = df["ROC_STR"].apply(normalize_roc)
+        
+        # Sıralama ekle
+        if "SKOR" in df.columns:
+            valid_scores = df["SKOR"].notna()
+            df.loc[valid_scores, "SIRALAMA"] = df.loc[valid_scores, "SKOR"].rank(ascending=False, method="min")
+            df["SIRALAMA"] = df["SIRALAMA"].apply(lambda x: int(x) if pd.notna(x) else None)
+        
+        df = calculate_tlag_score(df)
         
         return df
     except Exception as e:
@@ -365,12 +701,10 @@ def load_comments_data(uploaded_file):
     try:
         df = pd.read_excel(uploaded_file, header=1, engine="openpyxl")
         
-        # İlk satırları temizle
         df = df[df.iloc[:, 0] != "65000 yorum sınırını aştınız."]
         df = df[df.iloc[:, 0] != "birim"]
         df = df.dropna(subset=[df.columns[0]], how="all")
         
-        # Kolon adlandırması
         column_names = {}
         if len(df.columns) >= 9:
             column_names = {
@@ -387,14 +721,10 @@ def load_comments_data(uploaded_file):
         
         df = df.rename(columns=column_names)
         
-        # Station code çıkarımı
         df["station_code"] = df["station_info"].apply(extract_station_code)
         df["score"] = pd.to_numeric(df["score"], errors="coerce")
-        
-        # Gelişmiş kategorizasyon
         df["categories"] = df["comment"].apply(categorize_comment_enhanced)
         
-        # 4 puan ama olumlu yorum tespiti
         df["positive_but_4star"] = df.apply(
             lambda row: (
                 row["score"] == 4 and 
@@ -410,16 +740,13 @@ def load_comments_data(uploaded_file):
         return None
 
 # ------------------------------------------------------------
-# İyileştirilmiş yorum birleştirme
+# Yorum birleştirme
 # ------------------------------------------------------------
 def merge_comments_with_tlag(comments_df, tlag_df):
-    """Yorum verilerini TLAG verisi ile gelişmiş birleştirme"""
+    """Yorum verilerini TLAG verisi ile birleştir"""
     try:
         st.write("🔍 Yorum verileri birleştiriliyor...")
-        st.write(f"📊 TLAG veri: {len(tlag_df)} istasyon")
-        st.write(f"💬 Yorum veri: {len(comments_df)} yorum")
         
-        # ROC kodları üzerinden birleştir
         merged = pd.merge(
             comments_df,
             tlag_df[["ROC_NORMALIZED", "ROC_STR", "İstasyon", "NOR", "DISTRICT", "Site Segment"]],
@@ -428,43 +755,28 @@ def merge_comments_with_tlag(comments_df, tlag_df):
             how="left"
         )
         
-        # Alternatif birleştirme - ROC_STR ile
         not_merged = merged[merged["İstasyon"].isna()]
         if not not_merged.empty:
-            st.write(f"⚠️ {len(not_merged)} yorum ROC_NORMALIZED ile eşleşmedi, ROC_STR deneniyor...")
-            
             merged2 = pd.merge(
-                not_merged[["station_code", "comment", "score", "categories", "dealer", "territory", "district", "positive_but_4star"]],
+                not_merged[comments_df.columns],
                 tlag_df[["ROC_STR", "İstasyon", "NOR", "DISTRICT", "Site Segment"]],
                 left_on="station_code",
                 right_on="ROC_STR",
                 how="left"
             )
             
-            # Eşleşenleri ana veri ile birleştir
             merged_part1 = merged[merged["İstasyon"].notna()]
             merged_part2 = merged2[merged2["İstasyon"].notna()]
             
             if not merged_part2.empty:
-                # Kolonları hizala
                 merged_part2["ROC_NORMALIZED"] = merged_part2["ROC_STR"]
                 merged = pd.concat([merged_part1, merged_part2], ignore_index=True)
         
-        # Boş alanları doldur
-        merged["NOR_FINAL"] = merged["NOR"].fillna(merged["territory"])
-        merged["DISTRICT_FINAL"] = merged["DISTRICT"].fillna(merged["district"])
+        merged["NOR_FINAL"] = merged["NOR"].fillna(merged.get("territory", ""))
+        merged["DISTRICT_FINAL"] = merged["DISTRICT"].fillna(merged.get("district", ""))
         
-        # Başarı raporu
         successful_matches = len(merged[merged["İstasyon"].notna()])
-        st.success(f"✅ {successful_matches}/{len(comments_df)} yorum başarıyla eşleştirildi!")
-        
-        if successful_matches < len(comments_df):
-            st.warning(f"⚠️ {len(comments_df) - successful_matches} yorum eşleştirilemedi")
-        
-        # District bazlı yorum dağılımı
-        district_comment_counts = merged.groupby("DISTRICT_FINAL").size().reset_index(columns=["Yorum_Sayısı"])
-        st.write("📊 District bazlı yorum dağılımı:")
-        st.dataframe(district_comment_counts, use_container_width=True)
+        st.success(f"✅ {successful_matches}/{len(comments_df)} yorum eşleştirildi!")
         
         return merged
     except Exception as e:
@@ -472,14 +784,13 @@ def merge_comments_with_tlag(comments_df, tlag_df):
         return comments_df
 
 # ------------------------------------------------------------
-# İyileştirilmiş analiz fonksiyonları
+# Analiz fonksiyonları
 # ------------------------------------------------------------
 def analyze_comments_by_scope(comments_df, scope_col="DISTRICT"):
-    """Kapsamlı yorum analizi - iyileştirilmiş"""
+    """Yorum analizi"""
     if comments_df is None or comments_df.empty:
         return {}
     
-    # Scope column belirleme
     if scope_col == "DISTRICT":
         group_col = "DISTRICT_FINAL"
     elif scope_col == "NOR":
@@ -488,34 +799,27 @@ def analyze_comments_by_scope(comments_df, scope_col="DISTRICT"):
         group_col = scope_col
         
     if group_col not in comments_df.columns:
-        st.warning(f"⚠️ {group_col} kolonu bulunamadı")
         return {}
     
     results = {}
-    
-    # Null olmayan grupları al
-    valid_comments = comments_df[comments_df[group_col].notna() & (comments_df[group_col] != "nan")]
+    valid_comments = comments_df[comments_df[group_col].notna()]
     
     for name, group in valid_comments.groupby(group_col):
-        if pd.isna(name) or str(name).strip() == "" or str(name).strip().lower() == "nan":
+        if pd.isna(name) or str(name).strip() == "":
             continue
             
         total_comments = len(group)
-        
         if total_comments == 0:
             continue
             
         avg_score = group["score"].mean()
-        
-        # Puan dağılımı
         score_dist = group["score"].value_counts().to_dict()
         
-        # Kategori analizi
         category_counts = {}
         category_scores = {}
         
         for _, row in group.iterrows():
-            if isinstance(row["categories"], list):
+            if isinstance(row.get("categories"), list):
                 for cat in row["categories"]:
                     if cat not in category_counts:
                         category_counts[cat] = 0
@@ -523,23 +827,17 @@ def analyze_comments_by_scope(comments_df, scope_col="DISTRICT"):
                     category_counts[cat] += 1
                     category_scores[cat].append(row["score"])
         
-        # Kategori ortalama puanları
         category_avg_scores = {
-            cat: np.mean(scores) for cat, scores in category_scores.items() if len(scores) > 0
+            cat: np.mean(scores) for cat, scores in category_scores.items()
         }
         
-        # En problemli kategoriler (düşük puan + yeterli sayıda yorum)
         problem_categories = {}
         for cat in category_counts:
-            if cat in category_avg_scores and category_avg_scores[cat] < 4.0 and category_counts[cat] >= 2:
+            if cat in category_avg_scores and category_avg_scores[cat] < 4.0:
                 problem_categories[cat] = {
                     "count": category_counts[cat],
-                    "avg_score": category_avg_scores[cat],
-                    "problem_level": (5 - category_avg_scores[cat]) * category_counts[cat]
+                    "avg_score": category_avg_scores[cat]
                 }
-        
-        # Olumlu ama 4 puan verenler
-        positive_4star = group[group.get("positive_but_4star", False) == True]
         
         results[name] = {
             "total_comments": total_comments,
@@ -547,29 +845,147 @@ def analyze_comments_by_scope(comments_df, scope_col="DISTRICT"):
             "score_distribution": score_dist,
             "category_counts": category_counts,
             "category_avg_scores": category_avg_scores,
-            "problem_categories": sorted(
-                problem_categories.items(), 
-                key=lambda x: x[1]["problem_level"], 
-                reverse=True
-            )[:3],
-            "positive_4star_count": len(positive_4star),
-            "critical_issues": len(group[group["score"] <= 2])
+            "problem_categories": problem_categories
         }
     
     return results
 
 # ------------------------------------------------------------
-# Yorum görüntüleme fonksiyonu
+# UI Fonksiyonları
 # ------------------------------------------------------------
+def display_top_5_lists(df, comments_df=None, scope="Genel"):
+    """Top 5 listeler"""
+    st.markdown(f"### 🏆 {scope} - TOP 5 LİSTELER")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("#### 🔴 En Çok Şikayet")
+        if comments_df is not None and not comments_df.empty and "İstasyon" in comments_df.columns:
+            valid_comments = comments_df[comments_df["İstasyon"].notna()]
+            if not valid_comments.empty:
+                complaint_counts = valid_comments[valid_comments["score"] <= 3].groupby("İstasyon").size()
+                if not complaint_counts.empty:
+                    for idx, (station, count) in enumerate(complaint_counts.nlargest(5).items(), 1):
+                        st.write(f"{idx}. {station}: **{count}**")
+                else:
+                    st.info("Şikayet yok")
+            else:
+                st.info("Veri yok")
+        else:
+            st.info("Yorum yok")
+    
+    with col2:
+        st.markdown("#### ⚠️ En Kötü Skor")
+        if "SKOR" in df.columns:
+            worst = df.nsmallest(5, "SKOR")[["İstasyon", "SKOR"]]
+            for idx, (_, row) in enumerate(worst.iterrows(), 1):
+                st.write(f"{idx}. {row['İstasyon']}: **{row['SKOR']*100:.1f}%**")
+    
+    with col3:
+        st.markdown("#### ✅ En İyi Skor")
+        if "SKOR" in df.columns:
+            best = df.nlargest(5, "SKOR")[["İstasyon", "SKOR"]]
+            for idx, (_, row) in enumerate(best.iterrows(), 1):
+                st.write(f"{idx}. {row['İstasyon']}: **{row['SKOR']*100:.1f}%**")
+
+def display_segment_pie_charts(df):
+    """Segment dağılımı"""
+    st.markdown("### 🎪 SEGMENT DAĞILIMI")
+    
+    tab1, tab2, tab3 = st.tabs(["📊 Genel", "🏢 District", "📍 NOR"])
+    
+    with tab1:
+        segment_counts = df["Site Segment"].value_counts()
+        fig = px.pie(values=segment_counts.values, names=segment_counts.index,
+                    title="Genel Segment Dağılımı", hole=0.3)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        selected_segment = st.selectbox("Detay için seçin:", segment_counts.index)
+        if selected_segment:
+            segment_data = df[df["Site Segment"] == selected_segment]
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("İstasyon", len(segment_data))
+            with col2:
+                st.metric("Ort. Skor", f"{segment_data['SKOR'].mean()*100:.1f}%")
+            with col3:
+                st.metric("Min-Max", f"{segment_data['SKOR'].min()*100:.0f}%-{segment_data['SKOR'].max()*100:.0f}%")
+    
+    with tab2:
+        if "DISTRICT" in df.columns:
+            districts = sorted(df["DISTRICT"].dropna().unique())
+            selected_district = st.selectbox("District:", districts)
+            if selected_district:
+                district_data = df[df["DISTRICT"] == selected_district]
+                segment_counts = district_data["Site Segment"].value_counts()
+                fig = px.pie(values=segment_counts.values, names=segment_counts.index,
+                            title=f"{selected_district} Segment Dağılımı", hole=0.3)
+                st.plotly_chart(fig, use_container_width=True)
+    
+    with tab3:
+        if "NOR" in df.columns:
+            nors = sorted(df["NOR"].dropna().unique())
+            selected_nor = st.selectbox("NOR:", nors)
+            if selected_nor:
+                nor_data = df[df["NOR"] == selected_nor]
+                segment_counts = nor_data["Site Segment"].value_counts()
+                fig = px.pie(values=segment_counts.values, names=segment_counts.index,
+                            title=f"{selected_nor} Segment Dağılımı", hole=0.3)
+                st.plotly_chart(fig, use_container_width=True)
+
+def display_nor_interactive_chart(nor_data, comments_data=None):
+    """NOR puan dağılımı"""
+    st.markdown("### 📊 PUAN DAĞILIMI")
+    
+    if comments_data is not None and not comments_data.empty:
+        score_counts = comments_data["score"].value_counts().sort_index()
+        
+        fig = go.Figure()
+        colors = {5: '#28a745', 4: '#90EE90', 3: '#ffc107', 2: '#fd7e14', 1: '#dc3545'}
+        
+        for score in score_counts.index:
+            fig.add_trace(go.Bar(
+                x=[str(score)],
+                y=[score_counts[score]],
+                name=f'{score} Puan',
+                marker_color=colors.get(score, '#6c757d'),
+                text=[f"{score_counts[score]} anket"],
+                textposition='auto'
+            ))
+        
+        fig.update_layout(
+            title="Puan Dağılımı",
+            xaxis_title="Puan",
+            yaxis_title="Anket Sayısı",
+            showlegend=True,
+            height=400
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        selected_score = st.selectbox("Yorumları görmek için puan seçin:", [5, 4, 3, 2, 1])
+        
+        score_comments = comments_data[comments_data["score"] == selected_score]
+        if not score_comments.empty:
+            st.markdown(f"#### {selected_score} Puan Yorumları ({len(score_comments)} adet)")
+            
+            for idx, row in score_comments.head(5).iterrows():
+                categories_str = ", ".join(row["categories"]) if isinstance(row.get("categories"), list) else "GENEL"
+                st.markdown(f"""
+                **Kategoriler:** {categories_str}
+                _{row['comment']}_
+                ---
+                """)
+
 def display_comment_analysis_enhanced(analysis_data, title="Yorum Analizi"):
-    """Gelişmiş yorum analizi görüntüleme"""
+    """Yorum analizi görüntüleme"""
     if not analysis_data:
         st.info(f"📋 {title} için yorum verisi bulunamadı")
         return
     
     st.markdown(f"### 💬 {title}")
     
-    # Özet istatistikler
     total_areas = len(analysis_data)
     total_comments = sum(data["total_comments"] for data in analysis_data.values())
     avg_score_overall = np.mean([data["avg_score"] for data in analysis_data.values()])
@@ -580,82 +996,17 @@ def display_comment_analysis_enhanced(analysis_data, title="Yorum Analizi"):
     with col2:
         st.metric("Toplam Yorum", total_comments)
     with col3:
-        st.metric("Genel Ort. Puan", f"{avg_score_overall:.1f}/5")
-    
-    # Detaylı analiz
-    for name, data in analysis_data.items():
-        with st.expander(f"📍 {name} - {data['total_comments']} yorum (Ort: {data['avg_score']:.1f}/5)"):
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("**📊 Puan Dağılımı:**")
-                if data["score_distribution"]:
-                    score_df = pd.DataFrame(
-                        list(data["score_distribution"].items()), 
-                        columns=["Puan", "Sayı"]
-                    ).sort_values("Puan")
-                    
-                    fig = px.bar(
-                        score_df, x="Puan", y="Sayı", 
-                        color="Puan", color_continuous_scale="RdYlGn",
-                        title=f"{name} Puan Dağılımı"
-                    )
-                    st.plotly_chart(fig, use_container_width=True, key=f"score_{name}")
-            
-            with col2:
-                st.markdown("**⚠️ Problem Kategorileri:**")
-                if data["problem_categories"]:
-                    for i, (cat, cat_data) in enumerate(data["problem_categories"], 1):
-                        severity = "🔴" if cat_data["avg_score"] < 3.0 else "🟡" if cat_data["avg_score"] < 3.5 else "🟠"
-                        st.markdown(f"""
-                        **{i}. {cat}** {severity}
-                        - Ortalama: {cat_data['avg_score']:.1f}/5
-                        - Yorum: {cat_data['count']} adet
-                        """)
-                else:
-                    st.info("Problem kategorisi bulunamadı")
-            
-            # Kategori bazlı detaylar
-            if data["category_counts"]:
-                st.markdown("**📋 Tüm Kategoriler:**")
-                cat_summary = []
-                for cat, count in data["category_counts"].items():
-                    avg_score = data["category_avg_scores"].get(cat, 0)
-                    status = "🔴 Problem" if avg_score < 3.5 else "🟡 Dikkat" if avg_score < 4.0 else "🟢 İyi"
-                    cat_summary.append({
-                        "Kategori": cat,
-                        "Yorum Sayısı": count,
-                        "Ort. Puan": f"{avg_score:.1f}",
-                        "Durum": status
-                    })
-                
-                cat_df = pd.DataFrame(cat_summary).sort_values("Ort. Puan")
-                st.dataframe(cat_df, use_container_width=True)
+        st.metric("Ort. Puan", f"{avg_score_overall:.1f}/5")
 
-# Geri kalan kod (UI components, main dashboard vb.) aynı kalacak - sadece AI entegrasyonunu ve yorum analizini düzelttim.
-# Bu noktadan sonra önceki kodun geri kalanını da eklemem gerekiyor...
-
-# ------------------------------------------------------------
-# Ana yardımcı fonksiyonlar (devamı)
-# ------------------------------------------------------------
 def get_opportunity_stations(df):
-    """Fırsat istasyonlarını bulur (My Precious/Primitive <80%)"""
-    if df is None or df.empty or "SKOR" not in df.columns:
+    """Fırsat istasyonları"""
+    if df is None or df.empty or "SKOR" not in df.columns or "Site Segment" not in df.columns:
         return pd.DataFrame()
     
-    opportunity_mask = (
-        (df["Site Segment"].isin(["My Precious", "Primitive"])) & 
-        (df["SKOR"] < 0.80)
-    )
-    
-    return df[opportunity_mask].copy()
+    return df[(df["Site Segment"].isin(["My Precious", "Primitive"])) & (df["SKOR"] < 0.80)].copy()
 
-# ------------------------------------------------------------
-# UI Components
-# ------------------------------------------------------------
 def create_enhanced_metric_card(col, title, value, key, click_data=None):
-    """Gelişmiş metrik kartları"""
+    """Metrik kartı"""
     with col:
         st.markdown(f"""
         <div class="metric-card">
@@ -665,279 +1016,120 @@ def create_enhanced_metric_card(col, title, value, key, click_data=None):
         </div>
         """, unsafe_allow_html=True)
         
-        if st.button("📊 Detayları Göster", key=f"btn_{key}", use_container_width=True):
+        if st.button("📊 Detay", key=f"btn_{key}", use_container_width=True):
             st.session_state[f"show_{key}"] = not st.session_state.get(f"show_{key}", False)
-    
-    # Detay gösterimi
-    if st.session_state.get(f"show_{key}", False) and click_data is not None:
-        with st.expander(f"📋 {title} Detayları", expanded=True):
-            if key == "total_stations":
-                display_station_list(click_data)
-            elif key == "avg_score": 
-                display_score_improvement_analysis(click_data)
-            elif key.startswith("segment_"):
-                segment_name = key.replace("segment_", "").replace("_", " ")
-                display_segment_analysis(click_data, segment_name)
-            
-            if st.button("❌ Kapat", key=f"close_{key}"):
-                st.session_state[f"show_{key}"] = False
-                st.rerun()
 
-def display_station_list(df):
-    """İstasyon listesi gösterimi"""
-    if df is None or df.empty:
-        st.info("Veri bulunamadı")
-        return
+def display_all_stations_detail(df):
+    """Tüm istasyonlar detayı"""
+    st.markdown("### 📊 TÜM İSTASYONLAR")
     
-    display_cols = ["ROC_STR", "İstasyon", "SKOR", "DISTRICT", "NOR", "Site Segment"]
-    available_cols = [col for col in display_cols if col in df.columns]
+    col1, col2, col3 = st.columns(3)
     
-    display_df = df[available_cols].copy()
+    with col1:
+        district_filter = st.selectbox("District:", ["Tümü"] + sorted(df["DISTRICT"].dropna().unique().tolist()) if "DISTRICT" in df.columns else ["Tümü"])
+    with col2:
+        nor_filter = st.selectbox("NOR:", ["Tümü"] + sorted(df["NOR"].dropna().unique().tolist()) if "NOR" in df.columns else ["Tümü"])
+    with col3:
+        segment_filter = st.selectbox("Segment:", ["Tümü"] + sorted(df["Site Segment"].dropna().unique().tolist()) if "Site Segment" in df.columns else ["Tümü"])
     
+    filtered_df = df.copy()
+    if district_filter != "Tümü" and "DISTRICT" in df.columns:
+        filtered_df = filtered_df[filtered_df["DISTRICT"] == district_filter]
+    if nor_filter != "Tümü" and "NOR" in df.columns:
+        filtered_df = filtered_df[filtered_df["NOR"] == nor_filter]
+    if segment_filter != "Tümü" and "Site Segment" in df.columns:
+        filtered_df = filtered_df[filtered_df["Site Segment"] == segment_filter]
+    
+    st.metric("Filtrelenmiş İstasyon Sayısı", len(filtered_df))
+    
+    display_cols = ["ROC_STR", "İstasyon", "SKOR", "SIRALAMA", "DISTRICT", "NOR", "Site Segment"]
+    available_cols = [col for col in display_cols if col in filtered_df.columns]
+    
+    display_df = filtered_df[available_cols].copy()
     if "SKOR" in display_df.columns:
-        display_df["SKOR_FORMATTED"] = display_df["SKOR"].apply(
-            lambda x: f"{x*100:.1f}%" if pd.notna(x) else "N/A"
-        )
-        display_df = display_df.drop(columns=["SKOR"])
-        display_df = display_df.rename(columns={"SKOR_FORMATTED": "SKOR"})
+        display_df["SKOR"] = (display_df["SKOR"] * 100).round(1).astype(str) + "%"
     
-    # İstasyon seçimi için selectbox
-    st.markdown("### 🏪 İstasyon Seçin:")
-    selected_station = st.selectbox(
-        "İstasyon:", 
-        df["İstasyon"].tolist(),
-        key="station_detail_selector"
-    )
-    
-    if selected_station:
-        station_data = df[df["İstasyon"] == selected_station].iloc[0]
-        display_station_detail(station_data)
-    
-    # Tablo gösterimi
-    st.markdown("### 📊 Tüm İstasyonlar:")
     st.dataframe(display_df, use_container_width=True, height=400)
 
-def display_station_detail(station_data):
-    """Detaylı istasyon bilgileri"""
-    st.markdown(f"### 🏪 {station_data['İstasyon']} Detayları")
+def display_score_improvement_detail(df):
+    """Skor iyileştirme detayı"""
+    st.markdown("### 🎯 SKOR İYİLEŞTİRME")
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     
     with col1:
-        st.metric("Mevcut Skor", f"{station_data.get('SKOR', 0)*100:.1f}%")
-        st.metric("ROC Kodu", station_data.get('ROC_STR', 'N/A'))
+        st.markdown("#### 🏆 En Yüksek Skor")
+        if "SKOR" in df.columns:
+            top = df.nlargest(5, "SKOR")[["İstasyon", "SKOR"]]
+            top["SKOR"] = (top["SKOR"] * 100).round(1).astype(str) + "%"
+            st.dataframe(top)
     
     with col2:
-        st.metric("District", station_data.get('DISTRICT', 'N/A'))
-        st.metric("NOR", station_data.get('NOR', 'N/A'))
+        st.markdown("#### ⚠️ En Düşük Skor")
+        if "SKOR" in df.columns:
+            bottom = df.nsmallest(5, "SKOR")[["İstasyon", "SKOR"]]
+            bottom["SKOR"] = (bottom["SKOR"] * 100).round(1).astype(str) + "%"
+            st.dataframe(bottom)
+
+def save_data_to_supabase(df, comments_df=None):
+    """Supabase'e kaydet"""
+    if not SUPABASE_ENABLED or supabase is None:
+        return False
     
-    with col3:
-        st.metric("Site Segment", station_data.get('Site Segment', 'N/A'))
-        if pd.notna(station_data.get('TRANSACTION')):
-            st.metric("Transaction", f"{station_data['TRANSACTION']:,.0f}")
+    try:
+        if df is not None:
+            df_save = df.copy()
+            for col in df_save.columns:
+                if df_save[col].dtype == 'object':
+                    df_save[col] = df_save[col].astype(str)
+            
+            data = df_save.to_dict('records')
+            response = supabase.table('tlag_data').upsert(data).execute()
+            st.success("✅ TLAG verileri kaydedildi")
+        
+        if comments_df is not None:
+            comments_save = comments_df.copy()
+            if 'categories' in comments_save.columns:
+                comments_save['categories'] = comments_save['categories'].apply(json.dumps)
+            
+            for col in comments_save.columns:
+                if comments_save[col].dtype == 'object':
+                    comments_save[col] = comments_save[col].astype(str)
+            
+            data = comments_save.to_dict('records')
+            response = supabase.table('customer_comments').upsert(data).execute()
+            st.success("✅ Yorum verileri kaydedildi")
+        
+        return True
+    except Exception as e:
+        st.error(f"Kayıt hatası: {str(e)}")
+        return False
+
+def load_data_from_supabase():
+    """Supabase'den yükle"""
+    if not SUPABASE_ENABLED or supabase is None:
+        return None, None
     
-    # AI Analizi butonu
-    if st.button(f"🤖 {station_data['İstasyon']} için AI Analizi", key=f"ai_station_detail_{station_data.get('ROC_STR')}"):
-        with st.spinner("AI analizi yapılıyor..."):
-            station_code = station_data.get("ROC_NORMALIZED") or station_data.get("ROC_STR")
-            station_comments = None
-            
-            if st.session_state.get("comments_data") is not None:
-                station_comments = st.session_state.comments_data[
-                    st.session_state.comments_data["station_code"] == str(station_code)
-                ]
-            
-            station_df = pd.DataFrame([station_data])
-            ai_result = ai_recommendations_for_scope(
-                station_data['İstasyon'], 
-                station_df, 
-                station_comments
+    try:
+        response = supabase.table('tlag_data').select("*").execute()
+        tlag_df = pd.DataFrame(response.data) if response.data else None
+        
+        response = supabase.table('customer_comments').select("*").execute()
+        comments_df = pd.DataFrame(response.data) if response.data else None
+        
+        if comments_df is not None and 'categories' in comments_df.columns:
+            comments_df['categories'] = comments_df['categories'].apply(
+                lambda x: json.loads(x) if isinstance(x, str) else x
             )
-            st.markdown(ai_result)
-    
-    # Yorum analizi (eğer varsa)
-    if st.session_state.get("comments_data") is not None:
-        station_code = station_data.get("ROC_NORMALIZED") or station_data.get("ROC_STR")
-        station_comments = st.session_state.comments_data[
-            st.session_state.comments_data["station_code"] == str(station_code)
-        ]
         
-        if not station_comments.empty:
-            display_station_comments(station_comments)
-
-def display_station_comments(comments_df):
-    """İstasyon yorumlarını göster"""
-    st.markdown("### 💬 Müşteri Yorumları")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.metric("Toplam Yorum", len(comments_df))
-        st.metric("Ortalama Puan", f"{comments_df['score'].mean():.1f}")
-    
-    with col2:
-        # Puan dağılımı grafiği
-        score_counts = comments_df['score'].value_counts().sort_index()
-        fig = px.bar(
-            x=score_counts.index, 
-            y=score_counts.values,
-            title="Puan Dağılımı",
-            labels={"x": "Puan", "y": "Yorum Sayısı"}
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Kategori analizi
-    st.markdown("#### 📊 Kategori Bazlı Analiz")
-    category_scores = {}
-    
-    for _, row in comments_df.iterrows():
-        if isinstance(row["categories"], list):
-            for cat in row["categories"]:
-                if cat not in category_scores:
-                    category_scores[cat] = []
-                category_scores[cat].append(row["score"])
-    
-    # Kategori performansı tablosu
-    cat_data = []
-    for cat, scores in category_scores.items():
-        cat_data.append({
-            "Kategori": cat,
-            "Yorum Sayısı": len(scores),
-            "Ortalama Puan": f"{np.mean(scores):.1f}",
-            "Problem Seviyesi": "🔴 Yüksek" if np.mean(scores) < 3.5 else "🟡 Orta" if np.mean(scores) < 4.0 else "🟢 Düşük"
-        })
-    
-    cat_df = pd.DataFrame(cat_data).sort_values("Ortalama Puan")
-    st.dataframe(cat_df, use_container_width=True)
-    
-    # Son yorumlar
-    st.markdown("#### 💭 Son Yorumlar")
-    for _, comment in comments_df.head(5).iterrows():
-        with st.container():
-            cats = comment["categories"] if isinstance(comment["categories"], list) else ["GENEL"]
-            cat_tags = " ".join([f"`{cat}`" for cat in cats])
-            
-            st.markdown(f"""
-            **Puan: {comment['score']}/5** | {cat_tags}
-            
-            _{comment['comment']}_
-            
-            ---
-            """)
-
-def display_score_improvement_analysis(df):
-    """Skor iyileştirme analizi"""
-    st.markdown("### 🎯 Skor İyileştirme Stratejisi")
-    
-    if df is None or df.empty or "SKOR" not in df.columns:
-        st.info("Skor verisi bulunamadı")
-        return
-    
-    # Potansiyel impact hesaplama
-    improvement_opportunities = df[df["SKOR"] < 0.80].copy()
-    
-    if "TRANSACTION" in improvement_opportunities.columns:
-        improvement_opportunities["potential_impact"] = (
-            (0.80 - improvement_opportunities["SKOR"]) * 
-            improvement_opportunities["TRANSACTION"] / 1000
-        )
-        improvement_opportunities = improvement_opportunities.sort_values(
-            "potential_impact", ascending=False
-        )
-    else:
-        improvement_opportunities["potential_impact"] = 0.80 - improvement_opportunities["SKOR"]
-        improvement_opportunities = improvement_opportunities.sort_values(
-            "SKOR", ascending=True
-        )
-    
-    st.markdown("#### 🔥 En Yüksek Impact İstasyonlar (Top 10)")
-    
-    top_impact = improvement_opportunities.head(10)
-    
-    for idx, (_, row) in enumerate(top_impact.iterrows(), 1):
-        current_score = row["SKOR"] * 100
-        target_score = 80
-        potential_gain = target_score - current_score
-        
-        st.markdown(f"""
-        **{idx}. {row['İstasyon']}**
-        - Mevcut: {current_score:.1f}% → Hedef: {target_score}% (+{potential_gain:.1f} puan)
-        - District: {row.get('DISTRICT', 'N/A')} | Segment: {row.get('Site Segment', 'N/A')}
-        """)
-    
-    # Segment bazlı fırsatlar
-    st.markdown("#### 🎪 Segment Bazlı Fırsatlar")
-    
-    segment_opps = improvement_opportunities.groupby("Site Segment").agg({
-        "İstasyon": "count",
-        "SKOR": "mean",
-        "potential_impact": "sum"
-    }).reset_index()
-    
-    segment_opps = segment_opps.sort_values("potential_impact", ascending=False)
-    
-    for _, row in segment_opps.iterrows():
-        avg_score = row["SKOR"] * 100
-        st.markdown(f"""
-        **{row['Site Segment']}**: {row['İstasyon']} istasyon | Ort: {avg_score:.1f}%
-        """)
-
-def display_segment_analysis(df, segment_name):
-    """Segment analizi"""
-    st.markdown(f"### 🎯 {segment_name} Segment Analizi")
-    
-    if df is None or df.empty:
-        st.info("Veri bulunamadı")
-        return
-    
-    segment_data = df[df["Site Segment"] == segment_name] if "Site Segment" in df.columns else df
-    
-    if segment_data.empty:
-        st.info(f"{segment_name} segmentinde istasyon bulunamadı")
-        return
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("Toplam İstasyon", len(segment_data))
-    
-    with col2:
-        if "SKOR" in segment_data.columns:
-            avg_score = segment_data["SKOR"].mean() * 100
-            st.metric("Ortalama Skor", f"{avg_score:.1f}%")
-    
-    with col3:
-        if "DISTRICT" in segment_data.columns:
-            district_count = segment_data["DISTRICT"].nunique()
-            st.metric("District Sayısı", district_count)
-    
-    # En iyi ve en kötü istasyonlar
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("#### 🏆 En İyi 5 İstasyon")
-        if "SKOR" in segment_data.columns:
-            top5 = segment_data.nlargest(5, "SKOR")[["İstasyon", "SKOR", "DISTRICT"]].copy()
-            top5["SKOR"] = top5["SKOR"].apply(lambda x: f"{x*100:.1f}%")
-            st.dataframe(top5, use_container_width=True)
-    
-    with col2:
-        st.markdown("#### ⚠️ En Kötü 5 İstasyon")
-        if "SKOR" in segment_data.columns:
-            bottom5 = segment_data.nsmallest(5, "SKOR")[["İstasyon", "SKOR", "DISTRICT"]].copy()
-            bottom5["SKOR"] = bottom5["SKOR"].apply(lambda x: f"{x*100:.1f}%")
-            st.dataframe(bottom5, use_container_width=True)
+        return tlag_df, comments_df
+    except Exception as e:
+        st.error(f"Yükleme hatası: {str(e)}")
+        return None, None
 
 # ------------------------------------------------------------
-# Basitleştirilmiş veri kaydetme - Session Only
+# Sayfa yapılandırması
 # ------------------------------------------------------------
-def save_data_to_supabase(df, comments_df=None, period_meta=None):
-    """Veri session'da saklanıyor - Supabase devre dışı"""
-    if not SUPABASE_ENABLED:
-        st.info("ℹ️ Veriler session'da saklanıyor - Supabase şu anda devre dışı")
-        return
-
-# CSS ve sayfa yapılandırması - öncekiyle aynı
 st.set_page_config(
     page_title="TLAG Performance Analytics",
     page_icon="📊",
@@ -948,7 +1140,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     .main-header { 
-        font-size: clamp(2rem, 5vw, 3rem); 
+        font-size: 2.5rem; 
         font-weight: bold; 
         text-align: center;
         background: linear-gradient(90deg, #FF6B6B, #4ECDC4); 
@@ -956,7 +1148,6 @@ st.markdown("""
         -webkit-text-fill-color: transparent; 
         margin-bottom: 2rem; 
     }
-    
     .metric-card { 
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
         padding: 1.5rem; 
@@ -968,11 +1159,9 @@ st.markdown("""
         cursor: pointer; 
         transition: transform 0.3s; 
     }
-    
     .metric-card:hover { 
         transform: translateY(-5px); 
     }
-    
     .nav-section {
         background: linear-gradient(135deg, #4ECDC4 0%, #44A08D 100%);
         padding: 1rem;
@@ -980,7 +1169,6 @@ st.markdown("""
         margin: 1rem 0;
         text-align: center;
     }
-    
     .opportunity-card {
         background: linear-gradient(135deg, #FFA502 0%, #FF6B6B 100%);
         padding: 1rem;
@@ -1001,98 +1189,130 @@ if "analyzed_comments" not in st.session_state:
 if "current_view" not in st.session_state:
     st.session_state.current_view = "main"
 
+# ------------------------------------------------------------
 # ANA UYGULAMA
+# ------------------------------------------------------------
 def main():
-    st.markdown('<h1 class="main-header">📊 TLAG PERFORMANS ANALİTİK</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">📊 TLAG PERFORMANS ANALİTİK SİSTEMİ</h1>', unsafe_allow_html=True)
     
-    # SIDEBAR - Veri Yükleme
-    st.sidebar.markdown("## 📁 VERİ YÖNETİMİ")
+    # SAYFA AÇILDIĞINDA OTOMATİK VERİ YÜKLE
+    if "data_loaded" not in st.session_state:
+        st.session_state.data_loaded = False
     
-    # TLAG dosyası yükleme
-    uploaded_tlag = st.sidebar.file_uploader(
-        "TLAG Excel dosyası:", 
-        type=["xlsx", "xls"], 
-        help="İstasyon performans verilerini içeren Excel dosyası"
-    )
-    
-    # Yorum dosyası yükleme
-    uploaded_comments = st.sidebar.file_uploader(
-        "Müşteri Yorumları Excel dosyası:", 
-        type=["xlsx", "xls"], 
-        key="comments_uploader",
-        help="Müşteri yorum anket sonuçlarını içeren Excel dosyası"
-    )
-    
-    # Demo data yükleme
-    st.sidebar.markdown("## 🚀 DEMO VERİLERİ")
-    
-    if st.sidebar.button("☁️ Cloud Demo", use_container_width=True):
+    if not st.session_state.data_loaded:
         with st.spinner("Veriler yükleniyor..."):
-            tlag_df, comments_df, message = load_demo_data_from_cloud()
-            if tlag_df is not None:
-                st.session_state.tlag_data = tlag_df
-                st.sidebar.success("✅ TLAG demo verisi yüklendi")
-                
-                if comments_df is not None:
-                    # Yorum verilerini TLAG ile birleştir - iyileştirilmiş
-                    merged_comments = merge_comments_with_tlag(comments_df, tlag_df)
-                    st.session_state.comments_data = merged_comments
-                    
-                    # Yorum analizini yap - iyileştirilmiş
-                    district_analysis = analyze_comments_by_scope(merged_comments, "DISTRICT")
-                    nor_analysis = analyze_comments_by_scope(merged_comments, "NOR")
-                    
-                    st.session_state.analyzed_comments = {
-                        "district": district_analysis,
-                        "nor": nor_analysis
-                    }
-                    st.sidebar.success("✅ Yorum demo verisi yüklendi")
-                
-                # Session'a kaydet
-                save_data_to_supabase(tlag_df, merged_comments if comments_df is not None else None)
-            else:
-                st.sidebar.error(message)
+            # Önce Supabase'den dene
+            if SUPABASE_ENABLED and supabase:
+                tlag_df, comments_df = load_data_from_supabase()
+                if tlag_df is not None:
+                    st.session_state.tlag_data = tlag_df
+                    if comments_df is not None:
+                        st.session_state.comments_data = comments_df
+                        # Analiz et
+                        district_analysis = analyze_comments_by_scope(comments_df, "DISTRICT")
+                        nor_analysis = analyze_comments_by_scope(comments_df, "NOR")
+                        st.session_state.analyzed_comments = {
+                            "district": district_analysis,
+                            "nor": nor_analysis
+                        }
+                    st.session_state.data_loaded = True
+            
+            # Supabase'de veri yoksa demo yükle
+            if not st.session_state.data_loaded:
+                tlag_df, comments_df, _ = load_demo_data_from_cloud()
+                if tlag_df is not None:
+                    st.session_state.tlag_data = tlag_df
+                    if comments_df is not None:
+                        merged_comments = merge_comments_with_tlag(comments_df, tlag_df)
+                        st.session_state.comments_data = merged_comments
+                        district_analysis = analyze_comments_by_scope(merged_comments, "DISTRICT")
+                        nor_analysis = analyze_comments_by_scope(merged_comments, "NOR")
+                        st.session_state.analyzed_comments = {
+                            "district": district_analysis,
+                            "nor": nor_analysis
+                        }
+                    st.session_state.data_loaded = True
+                    # Demo veriyi Supabase'e kaydet
+                    if SUPABASE_ENABLED and supabase:
+                        save_data_to_supabase(tlag_df, st.session_state.comments_data)
     
-    # Dosya yükleme işlemi
-    if uploaded_tlag is not None:
-        with st.spinner("TLAG verileri işleniyor..."):
-            df = load_tlag_data(uploaded_tlag)
-            if df is not None:
-                st.session_state.tlag_data = df
-                st.sidebar.success(f"✅ {len(df)} istasyon verisi yüklendi")
-                save_data_to_supabase(df)
+    # SIDEBAR - VERİ YÖNETİMİ (GİZLENEBİLİR)
+    with st.sidebar:
+        with st.expander("🔐 Veri Yönetimi (Admin)", expanded=False):
+            st.markdown("### 📁 VERİ GÜNCELLEME")
+            
+            # Manuel veri yükleme
+            uploaded_tlag = st.file_uploader("TLAG Excel:", type=["xlsx", "xls"], key="tlag_upload")
+            uploaded_comments = st.file_uploader("Yorumlar Excel:", type=["xlsx", "xls"], key="comments_upload")
+            
+            if uploaded_tlag:
+                with st.spinner("TLAG verileri işleniyor..."):
+                    df = load_tlag_data(uploaded_tlag)
+                    if df is not None:
+                        st.session_state.tlag_data = df
+                        st.success(f"✅ {len(df)} istasyon")
+                        save_data_to_supabase(df, None)
+            
+            if uploaded_comments and st.session_state.tlag_data is not None:
+                with st.spinner("Yorumlar işleniyor..."):
+                    comments_df = load_comments_data(uploaded_comments)
+                    if comments_df is not None:
+                        merged = merge_comments_with_tlag(comments_df, st.session_state.tlag_data)
+                        st.session_state.comments_data = merged
+                        district_analysis = analyze_comments_by_scope(merged, "DISTRICT")
+                        nor_analysis = analyze_comments_by_scope(merged, "NOR")
+                        st.session_state.analyzed_comments = {
+                            "district": district_analysis,
+                            "nor": nor_analysis
+                        }
+                        st.success(f"✅ {len(comments_df)} yorum")
+                        save_data_to_supabase(None, merged)
+            
+            # Demo veri butonu
+            if st.button("🔄 Demo Veri Yükle", use_container_width=True):
+                with st.spinner("Demo veriler yükleniyor..."):
+                    tlag_df, comments_df, message = load_demo_data_from_cloud()
+                    if tlag_df is not None:
+                        st.session_state.tlag_data = tlag_df
+                        if comments_df is not None:
+                            merged = merge_comments_with_tlag(comments_df, tlag_df)
+                            st.session_state.comments_data = merged
+                            district_analysis = analyze_comments_by_scope(merged, "DISTRICT")
+                            nor_analysis = analyze_comments_by_scope(merged, "NOR")
+                            st.session_state.analyzed_comments = {
+                                "district": district_analysis,
+                                "nor": nor_analysis
+                            }
+                        save_data_to_supabase(tlag_df, st.session_state.comments_data)
+                        st.success("✅ Demo veriler yüklendi")
+                        st.rerun()
+        
+        # Kullanıcı bilgisi
+        st.markdown("---")
+        if st.session_state.get("tlag_data") is not None:
+            df = st.session_state.tlag_data
+            st.metric("📊 Toplam İstasyon", len(df))
+            if "SKOR" in df.columns:
+                st.metric("📈 Ort. TLAG", f"{df['SKOR'].mean()*100:.1f}%")
+            if st.session_state.get("comments_data") is not None:
+                st.metric("💬 Toplam Yorum", len(st.session_state.comments_data))
+        
+        st.markdown("---")
+        st.caption("TLAG Analytics v2.0")
+        st.caption("© 2024")
     
-    if uploaded_comments is not None and st.session_state.tlag_data is not None:
-        with st.spinner("Yorum verileri işleniyor..."):
-            comments_df = load_comments_data(uploaded_comments)
-            if comments_df is not None:
-                merged_comments = merge_comments_with_tlag(comments_df, st.session_state.tlag_data)
-                st.session_state.comments_data = merged_comments
-                
-                district_analysis = analyze_comments_by_scope(merged_comments, "DISTRICT")
-                nor_analysis = analyze_comments_by_scope(merged_comments, "NOR")
-                
-                st.session_state.analyzed_comments = {
-                    "district": district_analysis,
-                    "nor": nor_analysis
-                }
-                
-                st.sidebar.success(f"✅ {len(comments_df)} yorum yüklendi ve analiz edildi")
-                save_data_to_supabase(None, merged_comments)
-    
-    # MAIN CONTENT
+    # Ana içerik
     if st.session_state.current_view == "main":
         display_main_dashboard()
     elif st.session_state.current_view == "district":
         display_district_analysis()
     elif st.session_state.current_view == "nor":
-        display_nor_analysis() 
+        display_nor_analysis()
     elif st.session_state.current_view == "segmentation":
         display_segmentation_analysis()
 
 def display_main_dashboard():
-    """Ana dashboard görünümü"""
-    
+    """Ana dashboard"""
     if st.session_state.tlag_data is None:
         st.markdown("## 🎯 TLAG PERFORMANS ANALİTİK'E HOŞGELDİNİZ")
         st.info("👈 Sol panelden Excel dosyalarınızı yükleyin veya demo verilerini deneyin")
@@ -1100,290 +1320,378 @@ def display_main_dashboard():
     
     df = st.session_state.tlag_data
     
+    # AI Chat Box
+    ai_chat_interface(df, st.session_state.get("comments_data"))
+    
     # Ana metrikler
     st.markdown("## 📊 ANA METRİKLER")
     col1, col2, col3, col4 = st.columns(4)
     
-    create_enhanced_metric_card(
-        col1, "Toplam İstasyon", len(df), "total_stations", df
-    )
+    create_enhanced_metric_card(col1, "Toplam İstasyon", len(df), "total_stations", df)
     
     if "SKOR" in df.columns:
         avg_score = df["SKOR"].mean() * 100
-        create_enhanced_metric_card(
-            col2, "Ortalama Skor", f"{avg_score:.1f}%", "avg_score", df
-        )
+        create_enhanced_metric_card(col2, "Ortalama Skor", f"{avg_score:.1f}%", "avg_score", df)
     
     if "Site Segment" in df.columns:
         segments = df["Site Segment"].value_counts()
-        for idx, (segment, count) in enumerate(segments.head(2).items()):
-            if idx == 0:
-                create_enhanced_metric_card(
-                    col3, segment, count, f"segment_{segment.replace(' ', '_')}", 
-                    df[df["Site Segment"] == segment]
-                )
-            elif idx == 1:
-                create_enhanced_metric_card(
-                    col4, segment, count, f"segment_{segment.replace(' ', '_')}", 
-                    df[df["Site Segment"] == segment]
-                )
+        with col3:
+            if len(segments) > 0:
+                st.metric(segments.index[0], segments.iloc[0])
+        with col4:
+            if len(segments) > 1:
+                st.metric(segments.index[1], segments.iloc[1])
     
-    # District performans tablosu ve yorum analizi
+    # Detay gösterimleri
+    if st.session_state.get("show_total_stations", False):
+        display_all_stations_detail(df)
+    
+    if st.session_state.get("show_avg_score", False):
+        display_score_improvement_detail(df)
+    
+    # Segment pie chart
+    if "Site Segment" in df.columns:
+        display_segment_pie_charts(df)
+    
+    # District performans
     if "DISTRICT" in df.columns and "SKOR" in df.columns:
-        st.markdown("## 📈 DISTRICT PERFORMANS VE YORUM ANALİZİ")
+        st.markdown("## 📈 DISTRICT PERFORMANS")
         
-        col1, col2 = st.columns([1, 1])
+        district_performance = df.groupby("DISTRICT").agg({
+            "SKOR": "mean",
+            "İstasyon": "count"
+        }).reset_index()
         
-        with col1:
-            st.markdown("### 📊 District Performans Tablosu")
-            district_performance = df.groupby("DISTRICT").agg({
-                "SKOR": "mean",
-                "İstasyon": "count"
-            }).reset_index()
-            
-            district_performance["SKOR_FORMATTED"] = district_performance["SKOR"].apply(
-                lambda x: f"{x*100:.1f}%"
-            )
-            
-            district_performance = district_performance.sort_values("SKOR", ascending=False)
-            st.dataframe(district_performance[["DISTRICT", "İstasyon", "SKOR_FORMATTED"]], use_container_width=True)
+        district_performance["SKOR_FORMAT"] = (district_performance["SKOR"] * 100).round(1).astype(str) + "%"
+        district_performance = district_performance.sort_values("SKOR", ascending=False)
         
-        with col2:
-            st.markdown("### 💬 District Yorum Analizi")
-            if st.session_state.get("analyzed_comments") and st.session_state.analyzed_comments.get("district"):
-                display_comment_analysis_enhanced(
-                    st.session_state.analyzed_comments["district"], 
-                    "District Bazlı Yorumlar"
-                )
-            else:
-                st.info("Yorum verisi yüklenirken analiz edilecek")
+        fig = px.bar(district_performance, x="DISTRICT", y="İstasyon",
+                    text="SKOR_FORMAT", title="District Performansları")
+        fig.update_traces(textposition='outside')
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Top 5 listeler
+    display_top_5_lists(df, st.session_state.get("comments_data"))
     
     # Fırsat istasyonları
     opportunity_stations = get_opportunity_stations(df)
     if not opportunity_stations.empty:
         st.markdown("## 🎯 FIRSAT İSTASYONLARI")
-        st.markdown("*My Precious veya Primitive segment, 80% altı skor*")
+        st.markdown(f"**{len(opportunity_stations)} fırsat istasyonu** (My Precious/Primitive, <80% skor)")
         
-        st.markdown(f"**Toplam {len(opportunity_stations)} fırsat istasyonu tespit edildi**")
-        
-        # En yüksek potansiyelli ilk 10
-        if "TRANSACTION" in opportunity_stations.columns:
-            opportunity_stations["potential"] = (
-                (0.80 - opportunity_stations["SKOR"]) * 
-                opportunity_stations["TRANSACTION"] / 1000
-            )
-            top_opportunities = opportunity_stations.nlargest(10, "potential")
-        else:
-            top_opportunities = opportunity_stations.nsmallest(10, "SKOR")
-        
-        for idx, (_, station) in enumerate(top_opportunities.iterrows(), 1):
+        for idx, (_, station) in enumerate(opportunity_stations.head(5).iterrows(), 1):
             current_score = station["SKOR"] * 100
-            potential_gain = 80 - current_score
-            
             st.markdown(f"""
             <div class="opportunity-card">
                 <strong>{idx}. {station['İstasyon']}</strong><br>
-                Mevcut: {current_score:.1f}% → Hedef: 80% (+{potential_gain:.1f} puan)<br>
-                <small>{station['DISTRICT']} | {station['Site Segment']}</small>
+                Mevcut: {current_score:.1f}% → Hedef: 80%<br>
+                <small>{station.get('DISTRICT', '')} | {station['Site Segment']}</small>
             </div>
             """, unsafe_allow_html=True)
     
     # Navigasyon
-    st.markdown("## 🎯 HANGİ ANALİZİ YAPMAK İSTİYORSUNUZ?")
+    st.markdown("## 🎯 ANALİZ SEÇENEKLERİ")
     
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.markdown("""
-        <div class="nav-section">
-            <h3>🏢 DISTRICT</h3>
-            <p>Bölgesel performans ve AI analizi</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        if st.button("District Analizine Git", key="nav_district", use_container_width=True, type="primary"):
+        st.markdown('<div class="nav-section"><h3>🏢 DISTRICT</h3></div>', unsafe_allow_html=True)
+        if st.button("District Analizi", key="nav_district", use_container_width=True):
             st.session_state.current_view = "district"
             st.rerun()
     
     with col2:
-        st.markdown("""
-        <div class="nav-section">
-            <h3>📍 NOR</h3>
-            <p>NOR bazlı performans ve AI analizi</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        if st.button("NOR Analizine Git", key="nav_nor", use_container_width=True, type="primary"):
+        st.markdown('<div class="nav-section"><h3>📍 NOR</h3></div>', unsafe_allow_html=True)
+        if st.button("NOR Analizi", key="nav_nor", use_container_width=True):
             st.session_state.current_view = "nor"
             st.rerun()
     
     with col3:
-        st.markdown("""
-        <div class="nav-section">
-            <h3>🎪 SİTE SEGMENTASYON</h3>
-            <p>Segment bazlı performans analizi</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        if st.button("Segmentasyon Analizine Git", key="nav_segmentation", use_container_width=True, type="primary"):
+        st.markdown('<div class="nav-section"><h3>🎪 SEGMENTASYON</h3></div>', unsafe_allow_html=True)
+        if st.button("Segmentasyon", key="nav_segmentation", use_container_width=True):
             st.session_state.current_view = "segmentation"
             st.rerun()
 
 def display_district_analysis():
-    """District analiz sayfası - AI entegrasyonu ile"""
-    if st.button("🏠 Ana Sayfaya Dön", key="back_from_district"):
+    """District analizi"""
+    if st.button("🏠 Ana Sayfa"):
         st.session_state.current_view = "main"
         st.rerun()
     
-    st.markdown("## 🏢 DISTRICT BAZLI ANALİZ")
+    st.markdown("## 🏢 DISTRICT ANALİZİ")
     
     df = st.session_state.tlag_data
     if df is None or "DISTRICT" not in df.columns:
-        st.error("District verisi bulunamadı")
+        st.error("District verisi yok")
         return
     
     districts = sorted(df["DISTRICT"].dropna().unique())
-    selected_district = st.selectbox("District Seçin:", districts, key="district_selector")
+    selected_district = st.selectbox("District:", districts)
     
     if selected_district:
         district_data = df[df["DISTRICT"] == selected_district].copy()
         
-        # Temel metrikler
+        # District yorumları filtrele
+        district_comments = None
+        if st.session_state.get("comments_data") is not None:
+            district_comments = st.session_state.comments_data[
+                st.session_state.comments_data.get("DISTRICT_FINAL", "") == selected_district
+            ] if "DISTRICT_FINAL" in st.session_state.comments_data.columns else None
+        
         col1, col2, col3, col4 = st.columns(4)
-        
         with col1:
-            st.metric("İstasyon Sayısı", len(district_data))
-        
+            st.metric("İstasyon", len(district_data))
         with col2:
             if "SKOR" in district_data.columns:
-                avg_score = district_data["SKOR"].mean() * 100
-                st.metric("Ortalama Skor", f"{avg_score:.1f}%")
-        
+                st.metric("Ort. Skor", f"{district_data['SKOR'].mean()*100:.1f}%")
         with col3:
             if "Site Segment" in district_data.columns:
-                dominant_segment = district_data["Site Segment"].mode().iloc[0] if len(district_data["Site Segment"].mode()) > 0 else "N/A"
-                st.metric("Baskın Segment", dominant_segment)
-        
+                st.metric("Segment", district_data["Site Segment"].nunique())
         with col4:
             opportunity_count = len(get_opportunity_stations(district_data))
-            st.metric("Fırsat İstasyonu", opportunity_count)
+            st.metric("Fırsat", opportunity_count)
         
-        # AI Analizi
-        st.markdown("### 🤖 AI PERFORMANS ANALİZİ")
-        if st.button(f"🤖 {selected_district} için AI Analizi Oluştur", key=f"ai_district_{selected_district}"):
-            with st.spinner("AI analizi yapılıyor..."):
-                # District yorumlarını al
-                district_comments_df = None
-                if st.session_state.get("comments_data") is not None:
-                    district_comments_df = st.session_state.comments_data[
-                        st.session_state.comments_data["DISTRICT_FINAL"] == selected_district
-                    ]
-                
-                ai_result = ai_recommendations_for_scope(
-                    selected_district, 
-                    district_data, 
-                    district_comments_df
-                )
-                st.markdown(ai_result)
+        display_top_5_lists(district_data, district_comments, selected_district)
         
-        # District yorum analizi
-        if st.session_state.get("analyzed_comments") and st.session_state.analyzed_comments.get("district"):
-            district_comments = st.session_state.analyzed_comments["district"]
-            if selected_district in district_comments:
-                display_comment_analysis_enhanced({selected_district: district_comments[selected_district]}, 
-                                                f"{selected_district} Müşteri Yorumları")
+        # AI Öneriler - Geliştirilmiş
+        st.markdown("### 🤖 AI ANALİZİ VE ÖNERİLER")
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            ai_query = st.text_input(
+                "Analiz sorunuz:",
+                placeholder=f"{selected_district} için özel soru yazın veya hazır konulardan seçin",
+                key="district_ai_query"
+            )
+        
+        with col2:
+            ai_topics = [
+                "TLAG skorunu hızlı artırma",
+                "En düşük skorlu istasyonlar",
+                "Müşteri şikayetleri analizi",
+                "Personel performansı",
+                "Temizlik standartları",
+                "Market optimizasyonu"
+            ]
+            selected_topic = st.selectbox("Hazır konular:", [""] + ai_topics, key="district_topic")
+        
+        if st.button(f"🤖 Analiz Et", key="district_ai_btn"):
+            # Eğer hazır konu seçildiyse onu kullan, yoksa custom query
+            final_query = ai_query if ai_query else f"{selected_district} bölgesi için {selected_topic}"
+            
+            if final_query and final_query != f"{selected_district} bölgesi için ":
+                with st.spinner("Veriler analiz ediliyor..."):
+                    # Gerçek veri ile AI analizi
+                    result = get_ai_response(
+                        f"{selected_district} district {final_query}",
+                        district_data,
+                        district_comments
+                    )
+                    
+                    # Sonucu göster
+                    st.markdown("#### 📊 AI Analiz Sonucu:")
+                    st.info(result)
+                    
+                    # Analiz edilen veri özeti
+                    with st.expander("📈 Analiz Edilen Veri Detayları"):
+                        st.write(f"- İstasyon sayısı: {len(district_data)}")
+                        st.write(f"- Ortalama skor: {district_data['SKOR'].mean()*100:.2f}%")
+                        if district_comments is not None:
+                            st.write(f"- Yorum sayısı: {len(district_comments)}")
+                            st.write(f"- Ortalama yorum puanı: {district_comments['score'].mean():.2f}/5")
+            else:
+                st.warning("Lütfen bir soru yazın veya konu seçin")
 
 def display_nor_analysis():
-    """NOR analiz sayfası - AI entegrasyonu ile"""
-    if st.button("🏠 Ana Sayfaya Dön", key="back_from_nor"):
+    """NOR analizi"""
+    if st.button("🏠 Ana Sayfa"):
         st.session_state.current_view = "main"
         st.rerun()
     
-    st.markdown("## 📍 NOR BAZLI ANALİZ")
+    st.markdown("## 📍 NOR ANALİZİ")
     
     df = st.session_state.tlag_data
     if df is None or "NOR" not in df.columns:
-        st.error("NOR verisi bulunamadı")
+        st.error("NOR verisi yok")
         return
     
     nors = sorted(df["NOR"].dropna().unique())
-    selected_nor = st.selectbox("NOR Seçin:", nors, key="nor_selector")
+    selected_nor = st.selectbox("NOR:", nors)
     
     if selected_nor:
         nor_data = df[df["NOR"] == selected_nor].copy()
         
-        # Temel metrikler
+        # NOR yorumları filtrele
+        nor_comments = None
+        if st.session_state.get("comments_data") is not None:
+            nor_comments = st.session_state.comments_data[
+                st.session_state.comments_data.get("NOR_FINAL", "") == selected_nor
+            ] if "NOR_FINAL" in st.session_state.comments_data.columns else None
+        
         col1, col2, col3, col4 = st.columns(4)
-        
         with col1:
-            st.metric("İstasyon Sayısı", len(nor_data))
-        
+            st.metric("İstasyon", len(nor_data))
         with col2:
             if "SKOR" in nor_data.columns:
-                avg_score = nor_data["SKOR"].mean() * 100
-                st.metric("Ortalama Skor", f"{avg_score:.1f}%")
-        
+                st.metric("Ort. Skor", f"{nor_data['SKOR'].mean()*100:.1f}%")
         with col3:
-            if "DISTRICT" in nor_data.columns:
-                district_count = nor_data["DISTRICT"].nunique()
-                st.metric("District Sayısı", district_count)
-        
+            if nor_comments is not None:
+                st.metric("Yorum", len(nor_comments))
+            else:
+                st.metric("Yorum", 0)
         with col4:
             opportunity_count = len(get_opportunity_stations(nor_data))
-            st.metric("Fırsat İstasyonu", opportunity_count)
+            st.metric("Fırsat", opportunity_count)
         
-        # AI Analizi
-        st.markdown("### 🤖 AI PERFORMANS ANALİZİ")
-        if st.button(f"🤖 {selected_nor} için AI Analizi Oluştur", key=f"ai_nor_{selected_nor}"):
-            with st.spinner("AI analizi yapılıyor..."):
-                # NOR yorumlarını al
-                nor_comments_df = None
-                if st.session_state.get("comments_data") is not None:
-                    nor_comments_df = st.session_state.comments_data[
-                        st.session_state.comments_data["NOR_FINAL"] == selected_nor
-                    ]
+        # İnteraktif chart
+        if nor_comments is not None:
+            display_nor_interactive_chart(nor_data, nor_comments)
+        
+        # Top 5 listeler
+        display_top_5_lists(nor_data, nor_comments, selected_nor)
+        
+        # İstasyon detayı
+        st.markdown("### 📊 İSTASYON DETAYI")
+        selected_station = st.selectbox("İstasyon:", nor_data["İstasyon"].tolist())
+        
+        if selected_station:
+            station_data = nor_data[nor_data["İstasyon"] == selected_station].iloc[0]
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Skor", f"{station_data['SKOR']*100:.1f}%")
+                if "SIRALAMA" in station_data and pd.notna(station_data["SIRALAMA"]):
+                    st.markdown(f"### 🏆 Genel Sıralama: **{int(station_data['SIRALAMA'])}**")
+            with col2:
+                st.metric("Segment", station_data.get("Site Segment", "N/A"))
+            with col3:
+                if "TRANSACTION" in station_data and pd.notna(station_data["TRANSACTION"]):
+                    st.metric("Transaction", f"{station_data['TRANSACTION']:,.0f}")
+            
+            # İstasyon yorumları
+            if nor_comments is not None:
+                station_code = station_data.get("ROC_NORMALIZED") or station_data.get("ROC_STR")
+                station_comments = nor_comments[nor_comments.get("station_code", "") == str(station_code)]
                 
-                ai_result = ai_recommendations_for_scope(
-                    selected_nor, 
-                    nor_data, 
-                    nor_comments_df
-                )
-                st.markdown(ai_result)
+                if not station_comments.empty:
+                    st.markdown("#### 💬 İstasyon Yorumları")
+                    st.write(f"Toplam {len(station_comments)} yorum, Ortalama: {station_comments['score'].mean():.1f}/5")
+                    
+                    # Kategori özeti
+                    category_summary = {}
+                    for _, row in station_comments.iterrows():
+                        if isinstance(row.get("categories"), list):
+                            for cat in row["categories"]:
+                                if cat not in category_summary:
+                                    category_summary[cat] = {"count": 0, "total": 0}
+                                category_summary[cat]["count"] += 1
+                                category_summary[cat]["total"] += row["score"]
+                    
+                    if category_summary:
+                        st.write("**Problem Kategorileri:**")
+                        for cat, data in sorted(category_summary.items(), 
+                                               key=lambda x: x[1]["total"]/x[1]["count"]):
+                            avg = data["total"] / data["count"]
+                            if avg < 4.0:
+                                st.write(f"- {cat}: {data['count']} yorum, Ort: {avg:.1f}/5 ⚠️")
         
-        # NOR yorum analizi
-        if st.session_state.get("analyzed_comments") and st.session_state.analyzed_comments.get("nor"):
-            nor_comments = st.session_state.analyzed_comments["nor"]
-            if selected_nor in nor_comments:
-                display_comment_analysis_enhanced({selected_nor: nor_comments[selected_nor]}, 
-                                                f"{selected_nor} Müşteri Yorumları")
+        # AI Öneriler - Geliştirilmiş
+        st.markdown("### 🤖 AI ANALİZİ VE ÖNERİLER")
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            ai_query = st.text_input(
+                "Analiz sorunuz:",
+                placeholder=f"{selected_nor} için özel soru yazın veya hazır konulardan seçin",
+                key="nor_ai_query"
+            )
+        
+        with col2:
+            ai_topics = [
+                "TLAG skorunu en hızlı artırma yolları",
+                "En problemli istasyonlar ve çözümler",
+                "Müşteri şikayetleri analizi",
+                "Kategori bazlı iyileştirmeler",
+                "Fırsat istasyonları stratejisi"
+            ]
+            selected_topic = st.selectbox("Hazır konular:", [""] + ai_topics, key="nor_topic")
+        
+        if st.button(f"🤖 Analiz Et", key="nor_ai_btn"):
+            # Eğer hazır konu seçildiyse onu kullan, yoksa custom query
+            final_query = ai_query if ai_query else f"{selected_nor} için {selected_topic}"
+            
+            if final_query and final_query != f"{selected_nor} için ":
+                with st.spinner("Gerçek veriler analiz ediliyor..."):
+                    # Gerçek veri ile AI analizi
+                    result = get_ai_response(
+                        f"{selected_nor} NOR {final_query}",
+                        nor_data,
+                        nor_comments
+                    )
+                    
+                    # Sonucu göster
+                    st.markdown("#### 📊 AI Analiz Sonucu:")
+                    st.success(result)
+                    
+                    # Analiz edilen veri özeti
+                    with st.expander("📈 Analiz Edilen Veri Detayları"):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.write(f"**İstasyon Verileri:**")
+                            st.write(f"- Toplam: {len(nor_data)} istasyon")
+                            st.write(f"- Ort. skor: {nor_data['SKOR'].mean()*100:.2f}%")
+                            st.write(f"- Min skor: {nor_data['SKOR'].min()*100:.2f}%")
+                            st.write(f"- Max skor: {nor_data['SKOR'].max()*100:.2f}%")
+                        with col2:
+                            if nor_comments is not None:
+                                st.write(f"**Yorum Verileri:**")
+                                st.write(f"- Toplam: {len(nor_comments)} yorum")
+                                st.write(f"- Ort. puan: {nor_comments['score'].mean():.2f}/5")
+                                st.write(f"- 5 puan: {len(nor_comments[nor_comments['score']==5])}")
+                                st.write(f"- 1-2 puan: {len(nor_comments[nor_comments['score']<=2])}")
+            else:
+                st.warning("Lütfen bir soru yazın veya konu seçin")
 
 def display_segmentation_analysis():
-    """Segmentasyon analiz sayfası"""
-    if st.button("🏠 Ana Sayfaya Dön", key="back_from_segmentation"):
+    """Segmentasyon analizi"""
+    if st.button("🏠 Ana Sayfa"):
         st.session_state.current_view = "main"
         st.rerun()
     
-    st.markdown("## 🎪 SİTE SEGMENTASYON ANALİZİ")
+    st.markdown("## 🎪 SEGMENTASYON ANALİZİ")
     
     df = st.session_state.tlag_data
     if df is None or "Site Segment" not in df.columns:
-        st.error("Site Segment verisi bulunamadı")
+        st.error("Segment verisi yok")
         return
-    
-    # Segment genel bakış
-    st.markdown("### 📊 Segment Genel Bakış")
     
     segment_summary = df.groupby("Site Segment").agg({
         "İstasyon": "count",
-        "SKOR": ["mean", "min", "max"]
+        "SKOR": ["mean", "min", "max"] if "SKOR" in df.columns else ["count"]
     }).round(3)
     
-    segment_summary.columns = ["İstasyon Sayısı", "Ort. Skor", "Min Skor", "Max Skor"]
-    segment_summary["Ort. Skor %"] = (segment_summary["Ort. Skor"] * 100).round(1).astype(str) + "%"
-    segment_summary["Min Skor %"] = (segment_summary["Min Skor"] * 100).round(1).astype(str) + "%"
-    segment_summary["Max Skor %"] = (segment_summary["Max Skor"] * 100).round(1).astype(str) + "%"
-    
     st.dataframe(segment_summary, use_container_width=True)
+    
+    selected_segment = st.selectbox("Segment:", df["Site Segment"].unique())
+    
+    if selected_segment:
+        segment_data = df[df["Site Segment"] == selected_segment]
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### 🏆 En İyi 5")
+            if "SKOR" in segment_data.columns:
+                top5 = segment_data.nlargest(5, "SKOR")[["İstasyon", "SKOR"]]
+                top5["SKOR"] = (top5["SKOR"] * 100).round(1).astype(str) + "%"
+                st.dataframe(top5)
+        
+        with col2:
+            st.markdown("#### ⚠️ En Kötü 5")
+            if "SKOR" in segment_data.columns:
+                bottom5 = segment_data.nsmallest(5, "SKOR")[["İstasyon", "SKOR"]]
+                bottom5["SKOR"] = (bottom5["SKOR"] * 100).round(1).astype(str) + "%"
+                st.dataframe(bottom5)
 
 if __name__ == "__main__":
     main()
